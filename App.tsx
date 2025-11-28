@@ -2,7 +2,8 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { APP_NAME, MAX_VIDEO_SIZE_MB, LOOM_APP_ID } from './constants';
 import { generateId, getYouTubeId, getLoomId, parseTime, formatTime, base64ToArrayBuffer, audioBufferToWav } from './utils';
-import { sendMessageToGemini, uploadMedia, generateVideoTimeline, polishClipTranscripts, detectSilenceAndInactivity } from './services/geminiService';
+import { sendMessageToGemini, uploadMedia, generateVideoTimeline, detectSilenceAndInactivity } from './services/geminiService';
+import { polishClipTranscriptsWithClaude } from './services/claudeService';
 import { fetchVoices, generateSpeech, generateSpeechWithTimestamps, AlignmentData } from './services/elevenLabsService';
 import { renderVideo } from './services/ffmpegService'; // Now exports renderVideo (Canvas Recorder)
 import { fetchLoomVideo } from './services/scraperService';
@@ -866,7 +867,7 @@ export default function App() {
       if (clips.length === 0) return;
       setIsPolishing(true);
       try {
-          const improvements = await polishClipTranscripts(clips);
+          const improvements = await polishClipTranscriptsWithClaude(clips);
           setClips(prevClips => prevClips.map(clip => {
               const improved = improvements.find(i => i.id === clip.id);
               if (improved) {
@@ -1763,162 +1764,448 @@ export default function App() {
             </div>
 
             {hasAnalyzed && clips.length > 0 && (
-                <div className="h-72 shrink-0 bg-zinc-950 border-t border-zinc-800 flex flex-col relative z-20 shadow-[0_-5px_15px_rgba(0,0,0,0.3)]">
+                <div className="shrink-0 bg-[#1a1a1f] border-t border-zinc-800/50 flex flex-col relative z-20">
+                    {/* Generate All Audio Banner */}
                     {showGenerateAllBanner && (
-                        <div className="w-full bg-emerald-900/30 border-y border-emerald-500/30 px-6 py-3 flex justify-between items-center backdrop-blur-sm animate-in fade-in slide-in-from-bottom-2">
+                        <div className="w-full bg-gradient-to-r from-emerald-900/40 to-teal-900/40 border-b border-emerald-500/20 px-6 py-2.5 flex justify-between items-center backdrop-blur-sm">
                             <div className="flex items-center gap-3">
-                                <div className="p-2 bg-emerald-500/20 rounded-full text-emerald-400"><SpeakerWaveIcon /></div>
+                                <div className="p-1.5 bg-emerald-500/20 rounded-lg text-emerald-400"><SpeakerWaveIcon /></div>
                                 <div>
-                                    <h3 className="text-sm font-bold text-emerald-100">Scripts Polished & Ready</h3>
-                                    <p className="text-xs text-emerald-400/80">Generate a consistent voiceover for the entire video in one click.</p>
+                                    <h3 className="text-xs font-semibold text-emerald-100">Scripts Polished & Ready</h3>
+                                    <p className="text-[10px] text-emerald-400/70">Generate voiceover for entire video</p>
                                 </div>
                             </div>
                             <button 
                                 onClick={handleGenerateAllAudio}
                                 disabled={isGeneratingAllAudio}
-                                className="px-6 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-bold rounded-lg shadow-lg shadow-emerald-900/20 transition-all flex items-center gap-2"
+                                className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold rounded-md transition-all flex items-center gap-1.5"
                             >
                                 {isGeneratingAllAudio ? <LoadingSpinner /> : <WandIcon />}
-                                {isGeneratingAllAudio ? 'Synthesizing...' : 'Generate Full Audio'}
+                                {isGeneratingAllAudio ? 'Synthesizing...' : 'Generate Audio'}
                             </button>
                         </div>
                     )}
                     
-                    <div className="h-10 px-4 border-b border-zinc-800 flex items-center justify-between bg-zinc-900/50">
-                        <span className="text-xs font-bold text-zinc-500 uppercase tracking-wider">Transcription Timeline ({clips.length} Segments)</span>
-                        <div className="flex items-center gap-2">
+                    {/* Timeline Toolbar */}
+                    <div className="h-9 px-4 border-b border-zinc-800/50 flex items-center justify-between bg-[#1e1e24]">
+                        <div className="flex items-center gap-3">
+                            <div className="flex items-center gap-2">
+                                <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider">Speed</span>
+                                <span className="text-[10px] font-mono text-cyan-400 bg-zinc-800 px-1.5 py-0.5 rounded">1.0X</span>
+                            </div>
+                            <div className="h-4 w-px bg-zinc-700"></div>
+                            <button 
+                                onClick={splitClipAtPlayhead}
+                                disabled={!activeClipId}
+                                className="p-1.5 rounded hover:bg-zinc-800 text-zinc-400 hover:text-white transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                                title="Split at Playhead"
+                            >
+                                <ScissorsIcon />
+                            </button>
+                        </div>
+                        <div className="flex items-center gap-1.5">
                              <button 
                                 onClick={handlePolishScripts}
                                 disabled={isPolishing}
-                                className="text-xs px-3 py-1.5 rounded border border-zinc-700 text-emerald-300 hover:bg-zinc-800 hover:text-emerald-200 flex items-center gap-2 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                                title="Use AI to polish transcriptions to be professional and clear"
+                                className="text-[10px] px-2.5 py-1 rounded bg-zinc-800/80 border border-zinc-700/50 text-emerald-400 hover:bg-zinc-700 hover:text-emerald-300 flex items-center gap-1.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                title="Polish transcriptions"
                             >
                                 {isPolishing ? <LoadingSpinner /> : <WandIcon />}
-                                {isPolishing ? 'Polishing...' : 'Polish Scripts'}
+                                {isPolishing ? 'Polishing...' : 'Polish'}
                             </button>
                              <button 
                                 onClick={handleDetectSilence}
                                 disabled={isDetectingSilence}
-                                className="text-xs px-3 py-1.5 rounded border border-zinc-700 text-amber-300 hover:bg-zinc-800 hover:text-amber-200 flex items-center gap-2 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                                title="Find dead air and silence to cut"
+                                className="text-[10px] px-2.5 py-1 rounded bg-zinc-800/80 border border-zinc-700/50 text-amber-400 hover:bg-zinc-700 hover:text-amber-300 flex items-center gap-1.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                title="Find silence"
                             >
                                 {isDetectingSilence ? <LoadingSpinner /> : <MoonIcon />}
-                                {isDetectingSilence ? 'Finding...' : 'Find Silence'}
-                            </button>
-                             <button 
-                                onClick={splitClipAtPlayhead}
-                                disabled={!activeClipId}
-                                className="text-xs px-3 py-1.5 rounded border border-zinc-700 text-zinc-300 hover:bg-zinc-800 hover:text-white flex items-center gap-2 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                                title="Split Active Clip at Current Time"
-                            >
-                                <ScissorsIcon /> Split at Playhead
+                                Silence
                             </button>
                         </div>
                     </div>
 
-                    <div className="flex-1 overflow-x-auto overflow-y-hidden p-4 scrollbar-thin scrollbar-thumb-zinc-700 scrollbar-track-transparent">
-                        <div className="flex gap-1 h-full min-w-max items-end pb-2 px-2">
-                            {clips.map((clip, index) => {
-                                const isActive = activeClipId === clip.id;
-                                const isEditing = editingClipId === clip.id;
-                                const hasRedundancy = clip.redundancies && clip.redundancies.length > 0;
-                                const isGeneratingAudio = generatingAudioForClipId === clip.id;
+                    {/* Time Ruler - Clickable for seeking */}
+                    <div className="h-6 bg-[#16161a] border-b border-zinc-800/30 flex">
+                        <div className="w-28 shrink-0"></div>
+                        <div 
+                            className="flex-1 overflow-hidden relative cursor-pointer"
+                            onClick={(e) => {
+                                if (!video || !videoRef.current) return;
+                                const rect = e.currentTarget.getBoundingClientRect();
+                                const clickX = e.clientX - rect.left;
+                                const percentage = clickX / rect.width;
+                                const totalDuration = Math.max(...clips.map(c => c.endTime), 60);
+                                const newTime = percentage * totalDuration;
                                 
-                                return (
-                                    <div 
-                                        key={clip.id} 
-                                        className={`relative group flex flex-col justify-end w-56 h-full rounded-lg border-2 transition-all cursor-pointer bg-zinc-900 ${
-                                            isActive ? 'border-indigo-500 ring-2 ring-indigo-500/20 z-10 shadow-lg scale-[1.02] origin-bottom' : 'border-zinc-800 hover:border-zinc-600'
-                                        }`}
-                                        onClick={() => {
-                                            setActiveClipId(clip.id);
-                                            setIsPlaying(false);
-                                            if (videoRef.current) videoRef.current.currentTime = clip.startTime;
-                                        }}
-                                    >
-                                        <div className="absolute -top-3 left-0 w-full flex justify-between px-1 opacity-0 group-hover:opacity-100 transition-opacity z-20">
-                                            <div className="flex gap-0.5 bg-zinc-800 rounded shadow-sm border border-zinc-700">
-                                                <button onClick={(e) => { e.stopPropagation(); moveClip(index, 'left'); }} className="p-1 hover:text-white text-zinc-400"><ArrowLeftIcon/></button>
-                                                <button onClick={(e) => { e.stopPropagation(); moveClip(index, 'right'); }} className="p-1 hover:text-white text-zinc-400"><ArrowRightIcon/></button>
+                                // Find clip at this time
+                                const clipAtTime = clips.find(c => newTime >= c.startTime && newTime < c.endTime);
+                                if (clipAtTime) {
+                                    setActiveClipId(clipAtTime.id);
+                                    const offsetInClip = newTime - clipAtTime.startTime;
+                                    
+                                    // Sync audio if master audio exists
+                                    if (masterAudioUrl && clipAtTime.audioStartTime !== undefined && audioPlayerRef.current) {
+                                        const audioDuration = (clipAtTime.audioEndTime! - clipAtTime.audioStartTime!);
+                                        const videoDuration = (clipAtTime.endTime - clipAtTime.startTime);
+                                        const audioOffset = (offsetInClip / videoDuration) * audioDuration;
+                                        audioPlayerRef.current.currentTime = clipAtTime.audioStartTime + audioOffset;
+                                    }
+                                }
+                                
+                                videoRef.current.currentTime = Math.max(0, Math.min(newTime, totalDuration));
+                                setIsPlaying(false);
+                            }}
+                        >
+                            <div className="absolute inset-0 flex items-center pointer-events-none">
+                                {(() => {
+                                    const totalDuration = clips.length > 0 ? Math.max(...clips.map(c => c.endTime)) : 60;
+                                    const intervals = Math.ceil(totalDuration / 10);
+                                    return Array.from({ length: intervals + 1 }, (_, i) => (
+                                        <div key={i} className="flex items-center" style={{ minWidth: '80px' }}>
+                                            <div className="flex flex-col items-start">
+                                                <span className="text-[9px] font-mono text-zinc-500">{formatTime(i * 10)}</span>
                                             </div>
-                                            <button onClick={(e) => { e.stopPropagation(); deleteClip(clip.id); }} className="bg-zinc-800 p-1 rounded text-red-400 hover:text-red-300 border border-zinc-700 shadow-sm"><TrashIcon/></button>
+                                            <div className="flex-1 flex items-center gap-[7px] ml-1">
+                                                {Array.from({ length: 9 }, (_, j) => (
+                                                    <div key={j} className="w-px h-1.5 bg-zinc-700/50"></div>
+                                                ))}
+                                            </div>
                                         </div>
-
-                                        <div className="p-3 flex-1 flex flex-col gap-1 overflow-hidden relative">
-                                            <div className="flex justify-between items-center text-[10px] text-zinc-500 font-mono mb-1">
-                                                <span>{formatTime(clip.startTime)}</span>
-                                                <span>{formatTime(clip.endTime)}</span>
-                                            </div>
+                                    ));
+                                })()}
+                            </div>
+                            {/* Playhead on ruler - Draggable */}
+                            {video && videoRef.current && (
+                                <div 
+                                    className="absolute top-0 bottom-0 w-3 z-20 cursor-grab active:cursor-grabbing group"
+                                    style={{ 
+                                        left: `calc(${(videoRef.current.currentTime / Math.max(...clips.map(c => c.endTime), 60)) * 100}% - 6px)`,
+                                        transition: isPlaying ? 'none' : 'left 0.05s ease-out'
+                                    }}
+                                    onMouseDown={(e) => {
+                                        e.preventDefault();
+                                        e.stopPropagation();
+                                        const container = e.currentTarget.parentElement;
+                                        if (!container || !videoRef.current) return;
+                                        
+                                        const totalDuration = Math.max(...clips.map(c => c.endTime), 60);
+                                        const wasPlaying = isPlaying;
+                                        setIsPlaying(false);
+                                        
+                                        const handleMouseMove = (moveEvent: MouseEvent) => {
+                                            const rect = container.getBoundingClientRect();
+                                            const mouseX = moveEvent.clientX - rect.left;
+                                            const percentage = Math.max(0, Math.min(1, mouseX / rect.width));
+                                            const newTime = percentage * totalDuration;
                                             
-                                            <div className="text-[11px] font-medium text-zinc-400 line-clamp-3 leading-tight mb-1">
-                                                {clip.transcript || clip.title}
-                                            </div>
+                                            if (videoRef.current) {
+                                                videoRef.current.currentTime = newTime;
+                                            }
+                                            
+                                            // Update active clip and sync audio while dragging
+                                            const clipAtTime = clips.find(c => newTime >= c.startTime && newTime < c.endTime);
+                                            if (clipAtTime) {
+                                                setActiveClipId(clipAtTime.id);
+                                                const offsetInClip = newTime - clipAtTime.startTime;
+                                                
+                                                // Sync audio if master audio exists
+                                                if (masterAudioUrl && clipAtTime.audioStartTime !== undefined && audioPlayerRef.current) {
+                                                    const audioDuration = (clipAtTime.audioEndTime! - clipAtTime.audioStartTime!);
+                                                    const videoDuration = (clipAtTime.endTime - clipAtTime.startTime);
+                                                    const audioOffset = (offsetInClip / videoDuration) * audioDuration;
+                                                    audioPlayerRef.current.currentTime = clipAtTime.audioStartTime + audioOffset;
+                                                }
+                                            }
+                                        };
+                                        
+                                        const handleMouseUp = () => {
+                                            document.removeEventListener('mousemove', handleMouseMove);
+                                            document.removeEventListener('mouseup', handleMouseUp);
+                                            document.body.style.cursor = '';
+                                            document.body.style.userSelect = '';
+                                        };
+                                        
+                                        document.body.style.cursor = 'grabbing';
+                                        document.body.style.userSelect = 'none';
+                                        document.addEventListener('mousemove', handleMouseMove);
+                                        document.addEventListener('mouseup', handleMouseUp);
+                                    }}
+                                >
+                                    {/* Playhead line */}
+                                    <div className="absolute left-1/2 -translate-x-1/2 top-0 bottom-0 w-0.5 bg-orange-500"></div>
+                                    {/* Playhead handle */}
+                                    <div className="absolute left-1/2 -translate-x-1/2 -top-1 w-3 h-4 bg-orange-500 rounded-b-sm flex items-start justify-center shadow-lg group-hover:bg-orange-400 transition-colors">
+                                        <div className="w-1.5 h-1.5 mt-0.5 rounded-full bg-orange-200/50"></div>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    </div>
 
-                                            {clip.improvedTranscript && !isEditing && (
-                                                <div className="mt-1 pt-2 border-t border-zinc-800 text-[11px] font-medium text-emerald-400 leading-tight group/text relative">
-                                                    <span className="mr-1">✨</span>
-                                                    {clip.improvedTranscript}
-                                                    <button 
-                                                        onClick={(e) => { e.stopPropagation(); handleStartEdit(clip); }}
-                                                        className="absolute top-0 right-0 bg-zinc-800 p-1 rounded shadow text-zinc-400 hover:text-white opacity-0 group-hover/text:opacity-100 transition-opacity"
-                                                    >
-                                                        <PencilIcon />
-                                                    </button>
-                                                </div>
-                                            )}
+                    {/* Timeline Tracks Container */}
+                    <div className="flex-1 flex overflow-hidden" style={{ height: '180px' }}>
+                        {/* Track Labels */}
+                        <div className="w-28 shrink-0 bg-[#16161a] border-r border-zinc-800/30 flex flex-col">
+                            {/* Transcript Track Label */}
+                            <div className="h-14 flex items-center px-3 border-b border-zinc-800/30">
+                                <div className="flex items-center gap-2">
+                                    <span className="text-[10px] font-bold text-violet-400 uppercase tracking-wider">CLIPS</span>
+                                    <div className="flex gap-1">
+                                        <button className="w-4 h-4 rounded bg-zinc-800 flex items-center justify-center hover:bg-zinc-700">
+                                            <svg className="w-2 h-2 text-zinc-400" fill="currentColor" viewBox="0 0 8 8"><circle cx="4" cy="4" r="3"/></svg>
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                            {/* Polished Track Label */}
+                            <div className="h-14 flex items-center px-3 border-b border-zinc-800/30">
+                                <div className="flex items-center gap-2">
+                                    <span className="text-[10px] font-bold text-cyan-400 uppercase tracking-wider">POLISHED</span>
+                                </div>
+                            </div>
+                            {/* Issues Track Label */}
+                            <div className="flex-1 flex items-center px-3">
+                                <span className="text-[10px] font-bold text-amber-400/70 uppercase tracking-wider">ISSUES</span>
+                            </div>
+                        </div>
 
-                                            {isEditing && (
-                                                <div className="mt-1 pt-2 border-t border-zinc-800" onClick={(e) => e.stopPropagation()}>
-                                                    <textarea
-                                                        className="w-full h-24 bg-zinc-800 text-white text-[11px] p-2 rounded border border-zinc-600 focus:border-indigo-500 outline-none resize-none"
-                                                        value={editingText}
-                                                        onChange={(e) => setEditingText(e.target.value)}
-                                                        autoFocus
-                                                    />
-                                                    <div className="flex justify-end gap-1 mt-1">
-                                                        <button onClick={handleCancelEdit} className="p-1 bg-zinc-700 hover:bg-zinc-600 rounded"><XMarkIcon /></button>
-                                                        <button onClick={handleSaveEdit} className="p-1 bg-indigo-600 hover:bg-indigo-500 rounded text-white"><CheckIcon /></button>
-                                                    </div>
-                                                </div>
-                                            )}
-
-                                            {masterAudioUrl && !isEditing && (
-                                                <div className="mt-2 flex flex-col gap-1.5">
-                                                    <div className="text-[10px] bg-emerald-600 text-white py-1 rounded flex items-center justify-center gap-1 font-bold">
-                                                        <SpeakerWaveIcon /> Sync Active
-                                                    </div>
-                                                </div>
-                                            )}
-
-                                            {hasRedundancy && (
-                                                <div className="mt-auto space-y-1">
-                                                    {clip.redundancies!.map((issue, i) => (
-                                                        <div key={i} className={`rounded p-1.5 flex flex-col gap-1 border ${issue.type === 'silence' ? 'bg-amber-500/10 border-amber-500/30' : 'bg-rose-500/10 border-rose-500/30'}`}>
-                                                            <div className={`flex items-center gap-1 text-[10px] font-bold ${issue.type === 'silence' ? 'text-amber-400' : 'text-rose-400'}`}>
-                                                                {issue.type === 'silence' ? <MoonIcon /> : <WarningIcon />} 
-                                                                {issue.type === 'silence' ? `Silence (${issue.duration}s)` : 'Issue Detected'}
-                                                            </div>
+                        {/* Tracks Content */}
+                        <div 
+                            className="flex-1 overflow-x-auto overflow-y-hidden scrollbar-thin scrollbar-thumb-zinc-700 scrollbar-track-transparent relative"
+                            onClick={(e) => {
+                                // Only seek if clicking on the background, not on clips
+                                if ((e.target as HTMLElement).closest('[data-clip]')) return;
+                                if (!video || !videoRef.current) return;
+                                const rect = e.currentTarget.getBoundingClientRect();
+                                const clickX = e.clientX - rect.left + e.currentTarget.scrollLeft;
+                                const totalWidth = e.currentTarget.scrollWidth;
+                                const percentage = clickX / totalWidth;
+                                const totalDuration = Math.max(...clips.map(c => c.endTime), 60);
+                                const newTime = percentage * totalDuration;
+                                
+                                // Find clip at this time and sync audio
+                                const clipAtTime = clips.find(c => newTime >= c.startTime && newTime < c.endTime);
+                                if (clipAtTime) {
+                                    setActiveClipId(clipAtTime.id);
+                                    const offsetInClip = newTime - clipAtTime.startTime;
+                                    
+                                    // Sync audio if master audio exists
+                                    if (masterAudioUrl && clipAtTime.audioStartTime !== undefined && audioPlayerRef.current) {
+                                        const audioDuration = (clipAtTime.audioEndTime! - clipAtTime.audioStartTime!);
+                                        const videoDuration = (clipAtTime.endTime - clipAtTime.startTime);
+                                        const audioOffset = (offsetInClip / videoDuration) * audioDuration;
+                                        audioPlayerRef.current.currentTime = clipAtTime.audioStartTime + audioOffset;
+                                    }
+                                }
+                                
+                                videoRef.current.currentTime = Math.max(0, Math.min(newTime, totalDuration));
+                                setIsPlaying(false);
+                            }}
+                        >
+                            {/* Playhead Line - Full height */}
+                            {video && videoRef.current && (
+                                <div 
+                                    className="absolute top-0 bottom-0 w-0.5 bg-orange-500 z-30 pointer-events-none shadow-[0_0_8px_rgba(249,115,22,0.5)]"
+                                    style={{ 
+                                        left: `${(videoRef.current.currentTime / Math.max(...clips.map(c => c.endTime), 60)) * 100}%`,
+                                        transition: isPlaying ? 'none' : 'left 0.05s ease-out'
+                                    }}
+                                ></div>
+                            )}
+                            
+                            <div className="min-w-max h-full flex flex-col">
+                                {/* Transcript Clips Track */}
+                                <div className="h-14 border-b border-zinc-800/30 flex items-center px-2 gap-1 relative bg-[#1a1a1f]">
+                                    {clips.map((clip, index) => {
+                                        const isActive = activeClipId === clip.id;
+                                        const duration = clip.endTime - clip.startTime;
+                                        const clipWidth = Math.max(duration * 8, 60); // 8px per second, min 60px
+                                        
+                                        return (
+                                            <div 
+                                                key={clip.id}
+                                                data-clip="true"
+                                                className={`group relative h-10 rounded-md cursor-pointer overflow-hidden transition-all ${
+                                                    isActive 
+                                                        ? 'ring-2 ring-orange-500 ring-offset-1 ring-offset-[#1a1a1f] z-10' 
+                                                        : 'hover:brightness-110'
+                                                }`}
+                                                style={{ 
+                                                    width: `${clipWidth}px`,
+                                                    background: 'linear-gradient(135deg, #7c3aed 0%, #5b21b6 100%)'
+                                                }}
+                                                onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    setActiveClipId(clip.id);
+                                                    setIsPlaying(false);
+                                                    if (videoRef.current) videoRef.current.currentTime = clip.startTime;
+                                                }}
+                                            >
+                                                {/* Clip Content */}
+                                                <div className="absolute inset-0 p-1.5 flex flex-col justify-between overflow-hidden">
+                                                    <div className="flex items-start justify-between gap-1">
+                                                        <span className="text-[9px] font-medium text-white/90 line-clamp-2 leading-tight flex-1">
+                                                            {clip.transcript || clip.title}
+                                                        </span>
+                                                        {/* Clip Actions */}
+                                                        <div className="flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
                                                             <button 
-                                                                onClick={(e) => { e.stopPropagation(); fixRedundancy(clip.id, issue); }}
-                                                                className={`w-full text-center text-[10px] text-white rounded py-0.5 ${issue.type === 'silence' ? 'bg-amber-600 hover:bg-amber-500' : 'bg-rose-600 hover:bg-rose-500'}`}
+                                                                onClick={(e) => { e.stopPropagation(); moveClip(index, 'left'); }} 
+                                                                className="w-4 h-4 rounded bg-black/30 flex items-center justify-center hover:bg-black/50 text-white/70"
                                                             >
-                                                                {issue.type === 'silence' ? 'Remove Silence' : 'Auto-Fix'}
+                                                                <ArrowLeftIcon/>
+                                                            </button>
+                                                            <button 
+                                                                onClick={(e) => { e.stopPropagation(); moveClip(index, 'right'); }} 
+                                                                className="w-4 h-4 rounded bg-black/30 flex items-center justify-center hover:bg-black/50 text-white/70"
+                                                            >
+                                                                <ArrowRightIcon/>
+                                                            </button>
+                                                            <button 
+                                                                onClick={(e) => { e.stopPropagation(); deleteClip(clip.id); }} 
+                                                                className="w-4 h-4 rounded bg-red-500/30 flex items-center justify-center hover:bg-red-500/50 text-white/70"
+                                                            >
+                                                                <TrashIcon/>
                                                             </button>
                                                         </div>
-                                                    ))}
+                                                    </div>
+                                                    <div className="flex items-center justify-between">
+                                                        <span className="text-[8px] font-mono text-white/60">{formatTime(clip.startTime)}</span>
+                                                        <span className="text-[8px] font-mono text-white/60">{formatTime(clip.endTime)}</span>
+                                                    </div>
                                                 </div>
-                                            )}
+                                                {/* Clip edge handles */}
+                                                <div className="absolute left-0 top-0 bottom-0 w-1 bg-violet-300/30 rounded-l-md"></div>
+                                                <div className="absolute right-0 top-0 bottom-0 w-1 bg-violet-300/30 rounded-r-md"></div>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
 
-                                            {isGeneratingAudio && (
-                                                <div className="mt-2 flex items-center gap-1 text-[10px] text-indigo-300">
-                                                    <LoadingSpinner />
-                                                    <span>Generating audio...</span>
+                                {/* Polished Transcript Track */}
+                                <div className="h-14 border-b border-zinc-800/30 flex items-center px-2 gap-1 relative bg-[#18181c]">
+                                    {clips.map((clip, index) => {
+                                        const isActive = activeClipId === clip.id;
+                                        const isEditing = editingClipId === clip.id;
+                                        const duration = clip.endTime - clip.startTime;
+                                        const clipWidth = Math.max(duration * 8, 60);
+                                        const hasPolished = !!clip.improvedTranscript;
+                                        
+                                        return (
+                                            <div 
+                                                key={clip.id}
+                                                data-clip="true"
+                                                className={`group relative h-10 rounded-md cursor-pointer overflow-hidden transition-all ${
+                                                    isActive 
+                                                        ? 'ring-2 ring-orange-500 ring-offset-1 ring-offset-[#18181c] z-10' 
+                                                        : 'hover:brightness-110'
+                                                } ${!hasPolished ? 'opacity-40' : ''}`}
+                                                style={{ 
+                                                    width: `${clipWidth}px`,
+                                                    background: hasPolished 
+                                                        ? 'linear-gradient(135deg, #0d9488 0%, #0f766e 100%)' 
+                                                        : 'linear-gradient(135deg, #3f3f46 0%, #27272a 100%)'
+                                                }}
+                                                onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    setActiveClipId(clip.id);
+                                                    setIsPlaying(false);
+                                                    if (videoRef.current) videoRef.current.currentTime = clip.startTime;
+                                                }}
+                                            >
+                                                <div className="absolute inset-0 p-1.5 flex flex-col justify-between overflow-hidden">
+                                                    <div className="flex items-start justify-between gap-1">
+                                                        {isEditing ? (
+                                                            <div className="w-full" onClick={(e) => e.stopPropagation()}>
+                                                                <textarea
+                                                                    className="w-full h-6 bg-black/30 text-white text-[9px] p-1 rounded border border-teal-400/50 outline-none resize-none"
+                                                                    value={editingText}
+                                                                    onChange={(e) => setEditingText(e.target.value)}
+                                                                    autoFocus
+                                                                />
+                                                                <div className="flex justify-end gap-0.5 mt-0.5">
+                                                                    <button onClick={handleCancelEdit} className="p-0.5 bg-zinc-700 hover:bg-zinc-600 rounded"><XMarkIcon /></button>
+                                                                    <button onClick={handleSaveEdit} className="p-0.5 bg-teal-600 hover:bg-teal-500 rounded text-white"><CheckIcon /></button>
+                                                                </div>
+                                                            </div>
+                                                        ) : (
+                                                            <>
+                                                                <span className="text-[9px] font-medium text-white/90 line-clamp-2 leading-tight flex-1">
+                                                                    {hasPolished ? (
+                                                                        <><span className="mr-0.5">✨</span>{clip.improvedTranscript}</>
+                                                                    ) : (
+                                                                        <span className="text-zinc-400 italic">Not polished</span>
+                                                                    )}
+                                                                </span>
+                                                                {hasPolished && (
+                                                                    <button 
+                                                                        onClick={(e) => { e.stopPropagation(); handleStartEdit(clip); }}
+                                                                        className="w-4 h-4 rounded bg-black/30 flex items-center justify-center hover:bg-black/50 text-white/70 opacity-0 group-hover:opacity-100 transition-opacity shrink-0"
+                                                                    >
+                                                                        <PencilIcon />
+                                                                    </button>
+                                                                )}
+                                                            </>
+                                                        )}
+                                                    </div>
+                                                    {!isEditing && (
+                                                        <div className="flex items-center justify-between">
+                                                            {masterAudioUrl && hasPolished && (
+                                                                <div className="flex items-center gap-0.5 text-[8px] text-white/80 bg-black/20 px-1 rounded">
+                                                                    <SpeakerWaveIcon /> <span>Sync</span>
+                                                                </div>
+                                                            )}
+                                                            <span className="text-[8px] font-mono text-white/60 ml-auto">{formatTime(duration)}s</span>
+                                                        </div>
+                                                    )}
                                                 </div>
-                                            )}
-                                        </div>
-                                    </div>
-                                );
-                            })}
+                                                <div className="absolute left-0 top-0 bottom-0 w-1 bg-teal-300/30 rounded-l-md"></div>
+                                                <div className="absolute right-0 top-0 bottom-0 w-1 bg-teal-300/30 rounded-r-md"></div>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+
+                                {/* Issues/Redundancy Track */}
+                                <div className="flex-1 flex items-center px-2 gap-1 relative bg-[#1a1a1f]">
+                                    {clips.map((clip) => {
+                                        const hasRedundancy = clip.redundancies && clip.redundancies.length > 0;
+                                        const duration = clip.endTime - clip.startTime;
+                                        const clipWidth = Math.max(duration * 8, 60);
+                                        
+                                        if (!hasRedundancy) {
+                                            return <div key={clip.id} style={{ width: `${clipWidth}px` }} className="h-8 shrink-0"></div>;
+                                        }
+                                        
+                                        return (
+                                            <div 
+                                                key={clip.id}
+                                                className="h-8 rounded-md overflow-hidden flex gap-0.5"
+                                                style={{ width: `${clipWidth}px` }}
+                                            >
+                                                {clip.redundancies!.map((issue, i) => (
+                                                    <div 
+                                                        key={i} 
+                                                        className={`flex-1 rounded-md flex items-center justify-center gap-1 cursor-pointer transition-all hover:brightness-110 ${
+                                                            issue.type === 'silence' 
+                                                                ? 'bg-gradient-to-r from-amber-600/80 to-amber-700/80' 
+                                                                : 'bg-gradient-to-r from-rose-600/80 to-rose-700/80'
+                                                        }`}
+                                                        onClick={(e) => { e.stopPropagation(); fixRedundancy(clip.id, issue); }}
+                                                        title={issue.type === 'silence' ? `Remove ${issue.duration}s silence` : 'Auto-fix issue'}
+                                                    >
+                                                        {issue.type === 'silence' ? <MoonIcon /> : <WarningIcon />}
+                                                        <span className="text-[8px] text-white font-medium">
+                                                            {issue.type === 'silence' ? `${issue.duration}s` : 'Fix'}
+                                                        </span>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>
