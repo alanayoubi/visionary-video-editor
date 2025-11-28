@@ -13,29 +13,35 @@ const anthropic = new Anthropic({
 export const polishClipTranscriptsWithClaude = async (
   clips: Clip[]
 ): Promise<{ id: string; improvedText: string }[]> => {
+  console.log('🤖 CLAUDE: Starting script polishing with Claude Sonnet 4.5');
+  console.log(`🤖 CLAUDE: Processing ${clips.length} clips`);
+
   try {
     const inputPayload = clips
       .filter((c) => c.transcript && c.transcript.length > 0)
       .map((c) => ({ id: c.id, text: c.transcript }));
 
-    const prompt = `You are an experienced educator who excels at making complex topics accessible and engaging.
+    console.log('🤖 CLAUDE: Input payload:', inputPayload);
 
-I will provide raw video transcripts that need to be polished for clarity and friendliness.
+    const prompt = `You are a CHARISMATIC educator - think of the most engaging, friendly teacher or YouTube creator who makes learning feel exciting and approachable.
 
-**YOUR ROLE:**
-Transform these transcripts as if you're an experienced teacher explaining concepts to eager students—clear, warm, and encouraging without being overly casual or vague.
+I will provide raw video transcripts that need to be transformed into warm, energetic, conversational explanations.
 
-**TONE GUIDELINES:**
-1. **Friendly & Approachable**: Use conversational language that feels like a helpful mentor, not a formal textbook.
-2. **Clear & Concrete**: Replace vague phrases with specific, easy-to-understand explanations. Avoid jargon unless you explain it.
-3. **Encouraging**: Use positive, supportive language that builds confidence.
-4. **Natural Flow**: Write as people actually speak—use contractions, short sentences, and natural transitions.
+**YOUR PERSONALITY:**
+You're genuinely excited to help people learn. You speak like a friendly guide showing someone something cool, not like a formal instructor. Think warmth, enthusiasm, and genuine care for the learner.
+
+**TONE - BE CHARISMATIC:**
+1. **Warm & Inviting**: Start with welcoming phrases like "Alright, let's...", "Here's the cool part...", "Now check this out..."
+2. **Conversational & Natural**: Talk like you're sitting next to someone helping them - use "we", "you'll", "let's", "here's"
+3. **Encouraging & Positive**: "Great!", "Perfect!", "You're doing awesome!", "This is the fun part..."
+4. **Specific & Clear**: Give exact directions - never be vague. "Click the blue button in the top right" not "adjust the settings"
+5. **Energetic Flow**: Keep it moving with natural transitions - "Alright, next up...", "Now here's where it gets good..."
 
 **EDITING RULES:**
-1. **Remove Filler**: Cut "um", "uh", stutters, and unnecessary repetition.
-2. **Maintain Accuracy**: Keep all factual instructions intact—the visuals depend on this.
-3. **Preserve Structure**: Ensure smooth transitions between clips for a cohesive narrative.
-4. **Conversational Numbers**: Write numbers naturally ("fifty percent" not "50%").
+1. **Remove ALL Filler**: Cut every "um", "uh", "like", stutter, and repetition
+2. **Keep Facts Exact**: The visuals depend on accurate instructions - don't change what's being shown
+3. **Add Personality**: Make it sound like a real person who cares, not a robot reading instructions
+4. **Natural Speech**: Use contractions ("we'll", "you're", "let's"), write numbers as words ("fifty" not "50")
 
 **INPUT DATA:**
 ${JSON.stringify(inputPayload)}
@@ -43,11 +49,22 @@ ${JSON.stringify(inputPayload)}
 **OUTPUT FORMAT:**
 Return a valid JSON array of objects with keys: "id" and "improvedText".
 
-Example:
+**EXAMPLES OF THE CHARISMATIC TONE:**
+Before: "So um, you're going to click on settings"
+After: "Alright, let's open up your settings! You'll see the gear icon right up here in the top right corner."
+
+Before: "Navigate to the profile section and make changes"
+After: "Perfect! Now here's where it gets fun - we're going to customize your profile and make this space totally yours."
+
+Before: "Adjust the configuration"
+After: "Great! Now let's dial in these settings. Click this blue Configure button and we'll get everything set up just right."
+
 [
-  { "id": "clip-1", "improvedText": "Let's start by opening your settings. You'll find this in the top right corner—look for that gear icon." },
-  { "id": "clip-2", "improvedText": "Perfect! Now we're going to customize your profile. This is where you can really make the app your own." }
+  { "id": "clip-1", "improvedText": "Alright, let's get started! First thing we're going to do is open up your settings..." },
+  { "id": "clip-2", "improvedText": "Perfect! Now here's the cool part - we're customizing your profile to make it exactly how you want it..." }
 ]`;
+
+    console.log('🤖 CLAUDE: Sending request to Claude API...');
 
     const message = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
@@ -60,6 +77,10 @@ Example:
       ],
     });
 
+    console.log('🤖 CLAUDE: Received response from Claude');
+    console.log('🤖 CLAUDE: Model used:', message.model);
+    console.log('🤖 CLAUDE: Usage:', message.usage);
+
     // Extract text from Claude's response
     const responseText = message.content
       .filter((block) => block.type === 'text')
@@ -68,9 +89,14 @@ Example:
 
     // Parse JSON from response
     const jsonStr = responseText.replace(/```json|```/g, '').trim();
-    return JSON.parse(jsonStr);
+    const result = JSON.parse(jsonStr);
+
+    console.log('🤖 CLAUDE: Successfully polished scripts');
+    console.log('🤖 CLAUDE: Result:', result);
+
+    return result;
   } catch (error) {
-    console.error('Claude Polish Script Error:', error);
+    console.error('❌ CLAUDE ERROR: Script polishing failed:', error);
     return [];
   }
 };

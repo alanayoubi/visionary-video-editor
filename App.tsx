@@ -22,6 +22,9 @@ import {
   touchProject,
   bumpProjectUpdatedAt
 } from './services/projectService';
+import { loadUserSettings, saveElevenLabsApiKey } from './services/userSettingsService';
+import { useAuth } from './contexts/AuthContext';
+import AuthScreen from './components/AuthScreen';
 import { marked } from 'marked';
 
 // --- Icons ---
@@ -202,6 +205,26 @@ const DEFAULT_ELEVEN_LABS_SETTINGS: AppSettings = {
 };
 
 export default function App() {
+  const { user, loading: authLoading } = useAuth();
+
+  // Show auth screen if not logged in
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-zinc-900 flex items-center justify-center">
+        <LoadingSpinner />
+      </div>
+    );
+  }
+
+  if (!user) {
+    return <AuthScreen />;
+  }
+
+  return <AuthenticatedApp />;
+}
+
+function AuthenticatedApp() {
+  const { signOut } = useAuth();
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
   const [isLoadingProjects, setIsLoadingProjects] = useState(true);
   const [projectError, setProjectError] = useState<string | null>(null);
@@ -277,6 +300,36 @@ export default function App() {
       refreshProjectList();
   }, [refreshProjectList]);
 
+  // Load global Eleven Labs API key on app startup
+  useEffect(() => {
+      const loadGlobalSettings = async () => {
+          try {
+              const settings = await loadUserSettings();
+              if (settings.elevenLabsApiKey) {
+                  setElevenLabsSettings(prev => ({ ...prev, elevenLabsApiKey: settings.elevenLabsApiKey || '' }));
+              }
+          } catch (error) {
+              console.error('Failed to load global user settings:', error);
+          }
+      };
+      loadGlobalSettings();
+  }, []);
+
+  // Save Eleven Labs API key whenever it changes (debounced)
+  useEffect(() => {
+      const timeout = setTimeout(async () => {
+          if (elevenLabsSettings.elevenLabsApiKey) {
+              try {
+                  await saveElevenLabsApiKey(elevenLabsSettings.elevenLabsApiKey);
+              } catch (error) {
+                  console.error('Failed to save Eleven Labs API key:', error);
+              }
+          }
+      }, 1000); // Debounce by 1 second
+
+      return () => clearTimeout(timeout);
+  }, [elevenLabsSettings.elevenLabsApiKey]);
+
   const loadProjectContext = useCallback(async (projectId: string) => {
       setIsLoadingProjectState(true);
       setProjectError(null);
@@ -317,7 +370,10 @@ export default function App() {
           setActiveTab(savedTab === 'clips' ? 'clips' : 'chat');
           const savedImportMode = state?.editorMeta?.importMode === 'weblink' ? 'weblink' : 'upload';
           setImportMode(savedImportMode);
-          setElevenLabsSettings({ ...DEFAULT_ELEVEN_LABS_SETTINGS, ...(state?.settings || {}) });
+          // Load project settings but preserve global API key
+          const projectSettings = state?.settings || {};
+          const { elevenLabsApiKey, ...otherSettings } = projectSettings;
+          setElevenLabsSettings(prev => ({ ...DEFAULT_ELEVEN_LABS_SETTINGS, ...otherSettings, elevenLabsApiKey: prev.elevenLabsApiKey }));
           if (project.masterAudioStoragePath) {
               setMasterAudioUrl(getAssetPublicUrl(project.masterAudioStoragePath));
           } else {
@@ -394,11 +450,13 @@ export default function App() {
       const timeout = setTimeout(async () => {
           try {
               setAutoSaveStatus('saving');
+              // Don't save API key in project settings (it's global now)
+              const { elevenLabsApiKey, ...projectSettings } = elevenLabsSettings;
               await saveProjectState(activeProjectId, {
                   messages,
                   clips,
                   timelineEvents,
-                  settings: elevenLabsSettings,
+                  settings: projectSettings,
                   hasAnalyzed,
                   activeClipId,
                   masterAudioMeta: masterAudioUrl && activeProject?.masterAudioStoragePath ? {
@@ -864,10 +922,14 @@ export default function App() {
   };
 
   const handlePolishScripts = async () => {
+      console.log('🔵 BUTTON CLICKED: Polish Scripts button was clicked');
+      console.log('🔵 Number of clips:', clips.length);
       if (clips.length === 0) return;
       setIsPolishing(true);
+      console.log('🔵 About to call polishClipTranscriptsWithClaude...');
       try {
           const improvements = await polishClipTranscriptsWithClaude(clips);
+          console.log('🔵 Received improvements from Claude:', improvements);
           setClips(prevClips => prevClips.map(clip => {
               const improved = improvements.find(i => i.id === clip.id);
               if (improved) {
@@ -1630,9 +1692,22 @@ export default function App() {
                           </>
                       )}
                   </div>
-                  <div className="flex justify-end gap-2 mt-8 pt-4 border-t border-zinc-800">
-                      <button onClick={() => setShowSettings(false)} className="px-4 py-2 rounded text-sm text-zinc-400 hover:text-white transition-colors">Close</button>
-                      <button onClick={() => setShowSettings(false)} className="px-4 py-2 rounded text-sm bg-indigo-600 hover:bg-indigo-500 text-white font-medium shadow-lg shadow-indigo-900/20 transition-all">Save Configuration</button>
+                  <div className="mt-8 pt-4 border-t border-zinc-800 space-y-3">
+                      <div className="flex justify-end gap-2">
+                          <button onClick={() => setShowSettings(false)} className="px-4 py-2 rounded text-sm text-zinc-400 hover:text-white transition-colors">Close</button>
+                          <button onClick={() => setShowSettings(false)} className="px-4 py-2 rounded text-sm bg-indigo-600 hover:bg-indigo-500 text-white font-medium shadow-lg shadow-indigo-900/20 transition-all">Save Configuration</button>
+                      </div>
+                      <div className="flex justify-center">
+                          <button
+                              onClick={async () => {
+                                  await signOut();
+                                  setShowSettings(false);
+                              }}
+                              className="px-4 py-2 rounded text-sm text-red-400 hover:text-red-300 hover:bg-red-500/10 transition-colors"
+                          >
+                              Sign Out
+                          </button>
+                      </div>
                   </div>
               </div>
           </div>
