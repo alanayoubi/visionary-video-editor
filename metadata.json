@@ -1,0 +1,8 @@
+{
+  "name": "Visionary - Video Analysis AI",
+  "description": "A professional video analysis tool powered by Gemini. Upload videos to extract insights, transcribe audio, and analyze visual events at specific timestamps with frame-perfect precision.",
+  "requestFramePermissions": [
+    "display-capture",
+    "microphone"
+  ]
+}
