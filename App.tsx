@@ -2,7 +2,7 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { APP_NAME, MAX_VIDEO_SIZE_MB, LOOM_APP_ID } from './constants';
 import { generateId, getYouTubeId, getLoomId, parseTime, formatTime, base64ToArrayBuffer, audioBufferToWav } from './utils';
-import { sendMessageToGemini, uploadMedia, generateVideoTimeline, detectSilenceAndInactivity } from './services/geminiService';
+import { sendMessageToGemini, uploadMedia, generateVideoTimeline, detectSilenceAndInactivity, validateAndRepairTimeline } from './services/geminiService';
 import { polishClipTranscriptsWithClaude } from './services/claudeService';
 import { fetchVoices, generateSpeech, generateSpeechWithTimestamps, AlignmentData } from './services/elevenLabsService';
 import { renderVideo } from './services/ffmpegService'; // Now exports renderVideo (Canvas Recorder)
@@ -23,6 +23,7 @@ import {
   bumpProjectUpdatedAt
 } from './services/projectService';
 import { loadUserSettings, saveElevenLabsApiKey } from './services/userSettingsService';
+import { uploadVideoToBunny, isBunnyConfigured, BunnyUploadProgress } from './services/bunnyService';
 import { useAuth } from './contexts/AuthContext';
 import AuthScreen from './components/AuthScreen';
 import { marked } from 'marked';
@@ -243,7 +244,9 @@ function AuthenticatedApp() {
   const [isDeepScanning, setIsDeepScanning] = useState(false);
   const [hasAnalyzed, setHasAnalyzed] = useState(false);
   const [isPolishing, setIsPolishing] = useState(false);
+  const [isRegeneratingAll, setIsRegeneratingAll] = useState(false);
   const [isDetectingSilence, setIsDetectingSilence] = useState(false);
+  const [isValidatingContext, setIsValidatingContext] = useState(false);
   const [importMode, setImportMode] = useState<ImportMode>('upload');
   
   // ElevenLabs State
@@ -342,20 +345,40 @@ function AuthenticatedApp() {
           setActiveProjectId(projectId);
 
           if (project.videoStoragePath) {
-              const blob = await downloadProjectAsset(project.videoStoragePath);
               const fileName = project.videoFileName || `project-${projectId}.mp4`;
-              const mimeType = project.videoMimeType || blob.type || 'video/mp4';
-              const reconstructedFile = new File([blob], fileName, { type: mimeType });
-              const previewUrl = URL.createObjectURL(blob);
-              setVideo({
-                  file: reconstructedFile,
-                  previewUrl,
-                  fileUri: project.videoFileUri || '',
-                  mimeType,
-                  storagePath: project.videoStoragePath,
-                  storageUrl: previewUrl,
-                  fileName
-              });
+              const mimeType = project.videoMimeType || 'video/mp4';
+              
+              // Check if this is a Bunny CDN URL or Supabase storage path
+              const isBunnyUrl = project.videoStoragePath.includes('b-cdn.net') || 
+                                 project.videoStoragePath.startsWith('https://');
+              
+              if (isBunnyUrl) {
+                  // For Bunny CDN URLs, we can use the URL directly for playback
+                  // No need to download the whole file - just set the URL
+                  setVideo({
+                      file: new File([], fileName, { type: mimeType }), // Placeholder file
+                      previewUrl: project.videoStoragePath, // Use CDN URL directly
+                      fileUri: project.videoFileUri || '',
+                      mimeType,
+                      storagePath: project.videoStoragePath,
+                      storageUrl: project.videoStoragePath,
+                      fileName
+                  });
+              } else {
+                  // Supabase storage path - download the blob
+                  const blob = await downloadProjectAsset(project.videoStoragePath);
+                  const reconstructedFile = new File([blob], fileName, { type: blob.type || mimeType });
+                  const previewUrl = URL.createObjectURL(blob);
+                  setVideo({
+                      file: reconstructedFile,
+                      previewUrl,
+                      fileUri: project.videoFileUri || '',
+                      mimeType: blob.type || mimeType,
+                      storagePath: project.videoStoragePath,
+                      storageUrl: previewUrl,
+                      fileName
+                  });
+              }
           } else {
               setVideo(null);
           }
@@ -753,6 +776,7 @@ function AuthenticatedApp() {
       setIsUploading(true);
       const url = URL.createObjectURL(file);
       
+      // Upload to Gemini for AI analysis
       const fileUri = await uploadMedia(file);
       
       setVideo({
@@ -770,28 +794,57 @@ function AuthenticatedApp() {
       setCurrentSequenceTime(0);
       invalidateMasterAudio(); // Reset audio
 
+      // Upload to Bunny CDN for persistent storage (supports large files)
       try {
-          const uploadResult = await uploadProjectAsset(activeProjectId, file, {
-              type: 'video',
-              fileName: file.name,
-              contentType: file.type || 'video/mp4'
-          });
-          await updateProjectMetadata(activeProjectId, {
-              videoStoragePath: uploadResult.path,
-              videoFileName: file.name,
-              videoMimeType: file.type || 'video/mp4',
-              videoFileUri: fileUri
-          });
-          setActiveProject(prev => prev ? {
-              ...prev,
-              videoStoragePath: uploadResult.path,
-              videoFileName: file.name,
-              videoMimeType: file.type || 'video/mp4',
-              videoFileUri: fileUri
-          } : prev);
+          if (isBunnyConfigured()) {
+            console.log('Uploading video to Bunny CDN...');
+            const bunnyResult = await uploadVideoToBunny(
+              file, 
+              `${activeProjectId}-${file.name}`,
+              (progress) => {
+                console.log(`Bunny upload: ${progress.percentage}%`);
+              }
+            );
+            console.log('Bunny upload complete:', bunnyResult);
+            
+            await updateProjectMetadata(activeProjectId, {
+                videoStoragePath: bunnyResult.directPlayUrl, // Store the playback URL
+                videoFileName: file.name,
+                videoMimeType: file.type || 'video/mp4',
+                videoFileUri: fileUri
+            });
+            setActiveProject(prev => prev ? {
+                ...prev,
+                videoStoragePath: bunnyResult.directPlayUrl,
+                videoFileName: file.name,
+                videoMimeType: file.type || 'video/mp4',
+                videoFileUri: fileUri
+            } : prev);
+          } else {
+            // Fallback to Supabase if Bunny not configured
+            console.log('Bunny not configured, using Supabase storage...');
+            const uploadResult = await uploadProjectAsset(activeProjectId, file, {
+                type: 'video',
+                fileName: file.name,
+                contentType: file.type || 'video/mp4'
+            });
+            await updateProjectMetadata(activeProjectId, {
+                videoStoragePath: uploadResult.path,
+                videoFileName: file.name,
+                videoMimeType: file.type || 'video/mp4',
+                videoFileUri: fileUri
+            });
+            setActiveProject(prev => prev ? {
+                ...prev,
+                videoStoragePath: uploadResult.path,
+                videoFileName: file.name,
+                videoMimeType: file.type || 'video/mp4',
+                videoFileUri: fileUri
+            } : prev);
+          }
       } catch (storageError) {
-          console.error('Failed to persist video to Supabase', storageError);
-          alert('Video analyzed but failed to save to database. Please try again.');
+          console.error('Failed to persist video to storage', storageError);
+          alert('Video ready for analysis but failed to save to storage. You can still analyze the video.');
       }
 
     } catch (err: any) {
@@ -816,7 +869,7 @@ function AuthenticatedApp() {
         {
             id: systemId,
             role: Sender.Model,
-            text: `**Analysis Started.** \nUsing Transcription-First method to segment video into complete thoughts...`,
+            text: `**🔍 Context-Aware Analysis Started.** \nUsing multi-pass analysis to detect:\n• Complete thoughts & sentences\n• **Parallel actions** (things done "while waiting")\n• Context switches & detours\n• User intent at each moment`,
             timestamp: Date.now()
         }
       ]);
@@ -824,6 +877,11 @@ function AuthenticatedApp() {
       const analyzedEvents = await generateVideoTimeline(video.fileUri, video.mimeType);
       setTimelineEvents(analyzedEvents);
       setHasAnalyzed(true);
+
+      // Count context-aware features detected
+      const parallelActions = analyzedEvents.filter(e => e.isParallelAction).length;
+      const contextSwitches = analyzedEvents.filter(e => e.type === 'context_switch').length;
+      const uniqueContexts = new Set(analyzedEvents.map(e => e.contextId).filter(Boolean)).size;
 
       const audioEvents = analyzedEvents.filter(e => e.type === 'audio');
       const redundancyEvents = analyzedEvents.filter(e => e.type === 'redundancy');
@@ -835,12 +893,22 @@ function AuthenticatedApp() {
 
         const clipRedundancies = redundancyEvents.filter(r => r.seconds >= clipStart && r.seconds < clipEnd);
 
+        // Create chapter title with context awareness
+        let chapterTitle = `Chapter ${formatTime(e.seconds)}`;
+        if (e.isParallelAction) {
+          chapterTitle = `🔄 ${chapterTitle}`;
+        } else if (e.context === 'settings_detour') {
+          chapterTitle = `⚙️ ${chapterTitle}`;
+        } else if (e.context === 'waiting_interlude') {
+          chapterTitle = `⏳ ${chapterTitle}`;
+        }
+
         return {
             id: generateId(),
-            title: `Chapter ${formatTime(e.seconds)}`,
+            title: chapterTitle,
             startTime: clipStart,
             endTime: clipEnd,
-            description: "Visual analysis available.",
+            description: e.intent || "Visual analysis available.",
             transcript: e.description,
             redundancies: clipRedundancies
         };
@@ -851,12 +919,31 @@ function AuthenticatedApp() {
         setActiveClipId(generatedClips[0].id);
       }
 
+      // Build context-aware summary message
+      let summaryMsg = `**✅ Context-Aware Timeline Ready.** \nI have split the video into **${generatedClips.length} logical segments** with full context awareness.\n\n`;
+      
+      if (parallelActions > 0 || contextSwitches > 0 || uniqueContexts > 1) {
+        summaryMsg += `**Context Analysis:**\n`;
+        if (parallelActions > 0) {
+          summaryMsg += `• 🔄 Detected **${parallelActions} parallel actions** (things done while waiting)\n`;
+        }
+        if (contextSwitches > 0) {
+          summaryMsg += `• ↔️ Found **${contextSwitches} context switches** (detours & returns)\n`;
+        }
+        if (uniqueContexts > 1) {
+          summaryMsg += `• 🔗 Identified **${uniqueContexts} workflow chains**\n`;
+        }
+        summaryMsg += `\nThe script polishing will now maintain smooth transitions across these context changes.`;
+      } else {
+        summaryMsg += `Each clip represents a complete sentence or thought, ensuring smoother editing.`;
+      }
+
       setMessages(prev => [
         ...prev,
         {
           id: generateId(),
           role: Sender.Model,
-          text: `**Timeline Ready.** \nI have split the video into **${generatedClips.length} logical segments** based on your narration.\n\nEach clip now represents a complete sentence or thought, ensuring smoother editing.`,
+          text: summaryMsg,
           timestamp: Date.now()
         }
       ]);
@@ -921,15 +1008,107 @@ function AuthenticatedApp() {
       }
   };
 
+  /**
+   * Validates and repairs the timeline context relationships.
+   * Use this if you think the AI missed some parallel actions or context switches.
+   */
+  const handleValidateContext = async () => {
+      if (!video || timelineEvents.length === 0) return;
+      setIsValidatingContext(true);
+      
+      setMessages(prev => [
+        ...prev,
+        {
+          id: generateId(),
+          role: Sender.Model,
+          text: `**🔄 Validating Context...** \nRe-analyzing the video to verify parallel actions and context switches are correctly identified.`,
+          timestamp: Date.now()
+        }
+      ]);
+
+      try {
+          const validatedEvents = await validateAndRepairTimeline(
+            video.fileUri, 
+            video.mimeType, 
+            timelineEvents
+          );
+          
+          // Check what changed
+          const originalParallel = timelineEvents.filter(e => e.isParallelAction).length;
+          const newParallel = validatedEvents.filter(e => e.isParallelAction).length;
+          const originalSwitches = timelineEvents.filter(e => e.type === 'context_switch').length;
+          const newSwitches = validatedEvents.filter(e => e.type === 'context_switch').length;
+          
+          setTimelineEvents(validatedEvents);
+          
+          // Update clips with any new context info
+          setClips(prevClips => prevClips.map(clip => {
+            const matchingEvent = validatedEvents.find(e => 
+              Math.abs(e.seconds - clip.startTime) < 2
+            );
+            if (matchingEvent) {
+              let newTitle = clip.title.replace(/^[🔄⚙️⏳]\s*/, ''); // Remove existing icons
+              if (matchingEvent.isParallelAction) {
+                newTitle = `🔄 ${newTitle}`;
+              } else if (matchingEvent.context === 'settings_detour') {
+                newTitle = `⚙️ ${newTitle}`;
+              } else if (matchingEvent.context === 'waiting_interlude') {
+                newTitle = `⏳ ${newTitle}`;
+              }
+              return {
+                ...clip,
+                title: newTitle,
+                description: matchingEvent.intent || clip.description
+              };
+            }
+            return clip;
+          }));
+
+          // Report changes
+          let changeReport = `**✅ Context Validation Complete.**\n\n`;
+          if (newParallel !== originalParallel || newSwitches !== originalSwitches) {
+            changeReport += `**Changes detected:**\n`;
+            if (newParallel !== originalParallel) {
+              changeReport += `• Parallel actions: ${originalParallel} → ${newParallel}\n`;
+            }
+            if (newSwitches !== originalSwitches) {
+              changeReport += `• Context switches: ${originalSwitches} → ${newSwitches}\n`;
+            }
+            changeReport += `\nThe timeline has been updated. You may want to re-polish scripts to incorporate these changes.`;
+          } else {
+            changeReport += `No issues found. The original context analysis was correct.`;
+          }
+
+          setMessages(prev => [
+            ...prev,
+            {
+              id: generateId(),
+              role: Sender.Model,
+              text: changeReport,
+              timestamp: Date.now()
+            }
+          ]);
+
+      } catch (err) {
+          console.error(err);
+          alert("Failed to validate context.");
+      } finally {
+          setIsValidatingContext(false);
+      }
+  };
+
   const handlePolishScripts = async () => {
       console.log('🔵 BUTTON CLICKED: Polish Scripts button was clicked');
       console.log('🔵 Number of clips:', clips.length);
+      console.log('🔵 Timeline events for context:', timelineEvents.length);
       if (clips.length === 0) return;
       setIsPolishing(true);
-      console.log('🔵 About to call polishClipTranscriptsWithClaude...');
+      console.log('🔵 About to call polishClipTranscriptsWithClaude with context awareness...');
       try {
-          const improvements = await polishClipTranscriptsWithClaude(clips);
-          console.log('🔵 Received improvements from Claude:', improvements);
+          // Pass timeline events for context-aware polishing
+          // This helps Claude understand parallel actions and context switches
+          const improvements = await polishClipTranscriptsWithClaude(clips, timelineEvents);
+          console.log('🔵 Received context-aware improvements from Claude:', improvements);
           setClips(prevClips => prevClips.map(clip => {
               const improved = improvements.find(i => i.id === clip.id);
               if (improved) {
@@ -944,6 +1123,110 @@ function AuthenticatedApp() {
           alert("Failed to polish scripts.");
       } finally {
           setIsPolishing(false);
+      }
+  };
+
+  // --- REGENERATE ALL: Re-polish scripts AND regenerate audio in one click ---
+  const handleRegenerateAll = async () => {
+      if (clips.length === 0) return;
+      if (!elevenLabsSettings.elevenLabsApiKey || !elevenLabsSettings.elevenLabsVoiceId) {
+          setShowSettings(true);
+          return;
+      }
+
+      setIsRegeneratingAll(true);
+      console.log('🔄 REGENERATE ALL: Starting full regeneration...');
+
+      try {
+          // Step 1: Re-polish the scripts
+          console.log('🔄 Step 1: Re-polishing scripts...');
+          const improvements = await polishClipTranscriptsWithClaude(clips, timelineEvents);
+          console.log('🔄 Received new polished scripts:', improvements);
+          
+          // Update clips with new polished text
+          const updatedClips = clips.map(clip => {
+              const improved = improvements.find(i => i.id === clip.id);
+              if (improved) {
+                  return { ...clip, improvedTranscript: improved.improvedText };
+              }
+              return clip;
+          });
+          setClips(updatedClips);
+
+          // Step 2: Generate new audio with updated scripts
+          console.log('🔄 Step 2: Generating new audio...');
+          const tasks = updatedClips.filter(c => c.improvedTranscript);
+          if (tasks.length === 0) {
+              alert("No polished scripts to generate audio for.");
+              return;
+          }
+
+          const DELIMITER = " ... ";
+          const clipsTexts = tasks.map(c => {
+               const text = c.improvedTranscript || "";
+               return text.replace(/\.\.\./g, ",");
+          });
+          const fullText = clipsTexts.join(DELIMITER);
+
+          const { audioBase64, alignment } = await generateSpeechWithTimestamps(
+              elevenLabsSettings.elevenLabsApiKey,
+              fullText,
+              elevenLabsSettings
+          );
+
+          // Create new audio blob
+          const arrayBuffer = base64ToArrayBuffer(audioBase64);
+          const blob = new Blob([arrayBuffer], { type: 'audio/mpeg' });
+          const masterUrl = URL.createObjectURL(blob);
+
+          // Parse alignment data (same logic as handleGenerateAllAudio)
+          const alignChars = alignment.characters;
+          const alignStartTimes = alignment.character_start_times_seconds;
+          const alignEndTimes = alignment.character_end_times_seconds;
+
+          const clipBoundaries: { start: number, end: number }[] = [];
+          let cursor = 0;
+          let currentClipStart = 0;
+
+          while (cursor < alignChars.length) {
+              if (
+                  alignChars[cursor] === '.' &&
+                  alignChars[cursor + 1] === '.' &&
+                  alignChars[cursor + 2] === '.'
+              ) {
+                  const endOfPrevClip = alignStartTimes[cursor];
+                  clipBoundaries.push({ start: currentClipStart, end: endOfPrevClip });
+                  currentClipStart = alignEndTimes[cursor + 2];
+                  cursor += 3;
+                  while (cursor < alignChars.length && alignChars[cursor] === ' ') cursor++;
+              } else {
+                  cursor++;
+              }
+          }
+
+          if (alignEndTimes.length > 0) {
+              clipBoundaries.push({ start: currentClipStart, end: alignEndTimes[alignEndTimes.length - 1] });
+          }
+
+          // Map boundaries back to clips
+          const finalClips = updatedClips.map((c, idx) => {
+              const boundary = clipBoundaries[idx];
+              if (boundary && c.improvedTranscript) {
+                  return { ...c, audioStartTime: boundary.start, audioEndTime: boundary.end };
+              }
+              return c;
+          });
+
+          setClips(finalClips);
+          setMasterAudioUrl(masterUrl);
+
+          console.log('🔄 REGENERATE ALL: Complete! Scripts re-polished and audio regenerated.');
+
+      } catch (e) {
+          console.error('❌ Regenerate All failed:', e);
+          alert("Failed to regenerate. Please try again.");
+      } finally {
+          setIsRegeneratingAll(false);
       }
   };
 
@@ -1840,7 +2123,7 @@ function AuthenticatedApp() {
 
             {hasAnalyzed && clips.length > 0 && (
                 <div className="shrink-0 bg-[#1a1a1f] border-t border-zinc-800/50 flex flex-col relative z-20">
-                    {/* Generate All Audio Banner */}
+                    {/* Generate All Audio Banner - Shows when scripts are polished but no audio */}
                     {showGenerateAllBanner && (
                         <div className="w-full bg-gradient-to-r from-emerald-900/40 to-teal-900/40 border-b border-emerald-500/20 px-6 py-2.5 flex justify-between items-center backdrop-blur-sm">
                             <div className="flex items-center gap-3">
@@ -1857,6 +2140,28 @@ function AuthenticatedApp() {
                             >
                                 {isGeneratingAllAudio ? <LoadingSpinner /> : <WandIcon />}
                                 {isGeneratingAllAudio ? 'Synthesizing...' : 'Generate Audio'}
+                            </button>
+                        </div>
+                    )}
+                    
+                    {/* Regenerate Banner - Shows when audio already exists */}
+                    {hasPolishedScripts && audioGenerated && (
+                        <div className="w-full bg-gradient-to-r from-violet-900/30 to-indigo-900/30 border-b border-violet-500/20 px-6 py-2 flex justify-between items-center backdrop-blur-sm">
+                            <div className="flex items-center gap-3">
+                                <div className="p-1.5 bg-violet-500/20 rounded-lg text-violet-400">🔄</div>
+                                <div>
+                                    <h3 className="text-xs font-semibold text-violet-100">Audio Generated</h3>
+                                    <p className="text-[10px] text-violet-400/70">Not happy with the script? Regenerate everything in one click</p>
+                                </div>
+                            </div>
+                            <button 
+                                onClick={handleRegenerateAll}
+                                disabled={isRegeneratingAll || isPolishing || isGeneratingAllAudio}
+                                className="px-4 py-1.5 bg-violet-600 hover:bg-violet-500 text-white text-xs font-semibold rounded-md transition-all flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
+                                title="Re-polish scripts and regenerate audio"
+                            >
+                                {isRegeneratingAll ? <LoadingSpinner /> : '✨'}
+                                {isRegeneratingAll ? 'Regenerating...' : 'Regenerate Script & Audio'}
                             </button>
                         </div>
                     )}
@@ -1881,12 +2186,12 @@ function AuthenticatedApp() {
                         <div className="flex items-center gap-1.5">
                              <button 
                                 onClick={handlePolishScripts}
-                                disabled={isPolishing}
+                                disabled={isPolishing || isRegeneratingAll}
                                 className="text-[10px] px-2.5 py-1 rounded bg-zinc-800/80 border border-zinc-700/50 text-emerald-400 hover:bg-zinc-700 hover:text-emerald-300 flex items-center gap-1.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                                title="Polish transcriptions"
+                                title={hasPolishedScripts ? "Re-polish scripts with AI (will require new audio)" : "Polish transcriptions with AI"}
                             >
                                 {isPolishing ? <LoadingSpinner /> : <WandIcon />}
-                                {isPolishing ? 'Polishing...' : 'Polish'}
+                                {isPolishing ? 'Polishing...' : hasPolishedScripts ? 'Re-polish' : 'Polish'}
                             </button>
                              <button 
                                 onClick={handleDetectSilence}
@@ -1896,6 +2201,15 @@ function AuthenticatedApp() {
                             >
                                 {isDetectingSilence ? <LoadingSpinner /> : <MoonIcon />}
                                 Silence
+                            </button>
+                            <button 
+                                onClick={handleValidateContext}
+                                disabled={isValidatingContext || timelineEvents.length === 0}
+                                className="text-[10px] px-2.5 py-1 rounded bg-zinc-800/80 border border-zinc-700/50 text-cyan-400 hover:bg-zinc-700 hover:text-cyan-300 flex items-center gap-1.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                title="Re-validate parallel actions and context switches"
+                            >
+                                {isValidatingContext ? <LoadingSpinner /> : '🔄'}
+                                {isValidatingContext ? 'Validating...' : 'Validate'}
                             </button>
                         </div>
                     </div>
@@ -2316,16 +2630,54 @@ function AuthenticatedApp() {
                 </>
             ) : (
                 <div className="flex-1 overflow-y-auto bg-zinc-950 p-4 space-y-4">
-                     <h3 className="text-xs font-bold text-zinc-500 uppercase tracking-wider">Raw Analysis Events</h3>
+                     <h3 className="text-xs font-bold text-zinc-500 uppercase tracking-wider">Context-Aware Analysis Events</h3>
                      <div className="space-y-3">
                         {timelineEvents.map((evt, idx) => (
-                            <div key={idx} className="flex gap-3 pl-4 border-l-2 border-zinc-800 hover:border-indigo-500/50">
+                            <div key={idx} className={`flex gap-3 pl-4 border-l-2 transition-colors ${
+                              evt.isParallelAction ? 'border-cyan-500/70 bg-cyan-950/10' : 
+                              evt.type === 'context_switch' ? 'border-purple-500/70 bg-purple-950/10' :
+                              'border-zinc-800 hover:border-indigo-500/50'
+                            }`}>
                                 <div className="flex-1">
-                                    <div className="flex items-center gap-2 mb-1">
+                                    <div className="flex items-center gap-2 mb-1 flex-wrap">
                                         <span className="font-mono text-xs text-indigo-400 bg-zinc-900 px-1.5 py-0.5 rounded">{evt.timestamp}</span>
-                                        <span className={`text-[10px] px-1.5 py-0.5 rounded border ${evt.type === 'redundancy' ? 'border-rose-500 text-rose-400' : evt.type === 'silence' ? 'border-amber-500 text-amber-400' : 'border-zinc-700 text-zinc-500'}`}>{evt.type.toUpperCase()}</span>
+                                        <span className={`text-[10px] px-1.5 py-0.5 rounded border ${
+                                          evt.type === 'redundancy' ? 'border-rose-500 text-rose-400' : 
+                                          evt.type === 'silence' ? 'border-amber-500 text-amber-400' : 
+                                          evt.type === 'context_switch' ? 'border-purple-500 text-purple-400' :
+                                          evt.type === 'parallel_action' ? 'border-cyan-500 text-cyan-400' :
+                                          'border-zinc-700 text-zinc-500'
+                                        }`}>{evt.type.toUpperCase()}</span>
+                                        {/* Context indicators */}
+                                        {evt.isParallelAction && (
+                                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-400 border border-cyan-500/30">
+                                            🔄 PARALLEL
+                                          </span>
+                                        )}
+                                        {evt.context && evt.context !== 'main_task' && (
+                                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400">
+                                            {evt.context.replace(/_/g, ' ').toUpperCase()}
+                                          </span>
+                                        )}
+                                        {evt.resumesContextId && (
+                                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-500/20 text-green-400 border border-green-500/30">
+                                            ↩️ RETURNS
+                                          </span>
+                                        )}
                                     </div>
                                     <p className="text-xs text-zinc-400">{evt.description}</p>
+                                    {/* Intent display */}
+                                    {evt.intent && (
+                                      <p className="text-[10px] text-zinc-500 mt-1 italic">
+                                        Intent: {evt.intent}
+                                      </p>
+                                    )}
+                                    {/* Context chain indicator */}
+                                    {evt.contextId && (
+                                      <span className="text-[9px] text-zinc-600 font-mono">
+                                        chain: {evt.contextId}
+                                      </span>
+                                    )}
                                 </div>
                             </div>
                         ))}

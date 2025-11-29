@@ -303,6 +303,88 @@ export const polishClipTranscripts = async (clips: Clip[]): Promise<{id: string,
 };
 
 /**
+ * Validates and repairs timeline events by analyzing for parallel actions,
+ * context switches, and workflow patterns.
+ */
+export const validateAndRepairTimeline = async (
+  fileUri: string,
+  mimeType: string,
+  existingEvents: TimelineEvent[]
+): Promise<(TimelineEvent & { isParallelAction?: boolean; context?: string })[]> => {
+  try {
+    const existingJson = JSON.stringify(existingEvents.slice(0, 50)); // Limit for context size
+
+    const prompt = `
+    Analyze this video and the existing timeline to detect PARALLEL ACTIONS and CONTEXT SWITCHES.
+
+    **EXISTING TIMELINE:**
+    ${existingJson}
+
+    **YOUR TASK:**
+    Re-analyze the video focusing on:
+    1. **Parallel Actions**: When the user does something WHILE waiting for another task.
+       - Example: "While this downloads, let me show you the settings"
+       - Mark these with "isParallelAction": true
+    2. **Context Switches**: When the user temporarily switches context.
+       - "settings_detour": User opens settings/preferences
+       - "waiting_interlude": User fills time while waiting
+       - "main_workflow": Primary task being demonstrated
+    3. **Workflow Continuity**: Track when interrupted tasks resume.
+
+    **OUTPUT FORMAT:**
+    Return a JSON array of the timeline events, with these ADDED fields:
+    - "isParallelAction": boolean (true if action is done while waiting)
+    - "context": string ("main_workflow" | "settings_detour" | "waiting_interlude" | null)
+    - "type": can also be "context_switch" for explicit context changes
+
+    Keep ALL original events. Add the new fields. Add new "context_switch" events if you detect explicit switches.
+    `;
+
+    const contents = [
+      {
+        role: 'user',
+        parts: [
+          {
+            fileData: {
+              mimeType: mimeType,
+              fileUri: fileUri,
+            },
+          },
+          { text: prompt }
+        ],
+      }
+    ];
+
+    const response = await generateWithFallback(
+      "gemini-3-pro-preview",
+      "gemini-2.5-flash",
+      {
+        contents: contents,
+        config: {
+          responseMimeType: "application/json",
+          temperature: 0.2,
+        }
+      }
+    );
+
+    const text = response.text || "[]";
+    const jsonStr = text.replace(/```json|```/g, "").trim();
+    const validatedEvents = JSON.parse(jsonStr);
+    
+    return validatedEvents;
+
+  } catch (error) {
+    console.error("Timeline Validation Error:", error);
+    // Return original events with default values on error
+    return existingEvents.map(e => ({
+      ...e,
+      isParallelAction: false,
+      context: 'main_workflow'
+    }));
+  }
+};
+
+/**
  * Sends a message to Gemini using the uploaded File URI and the pre-computed timeline context.
  */
 export const sendMessageToGemini = async (

@@ -23,25 +23,46 @@ export const polishClipTranscriptsWithClaude = async (
 
     console.log('🤖 CLAUDE: Input payload:', inputPayload);
 
-    const prompt = `You are a CHARISMATIC educator - think of the most engaging, friendly teacher or YouTube creator who makes learning feel exciting and approachable.
+    const prompt = `You are a CHARISMATIC educator who polishes video scripts to sound more engaging and professional.
 
-I will provide raw video transcripts that need to be transformed into warm, energetic, conversational explanations.
+I will provide raw video transcripts. Your ONLY job is to improve the DELIVERY and LANGUAGE - NOT the content.
+
+**⚠️ CRITICAL - PRESERVE EXACTLY AS WRITTEN:**
+- ALL product names (e.g., "Nano Banana", "Gemini 3", "ChatGPT", etc.)
+- ALL brand names and company names
+- ALL proper nouns (people, places, organizations)
+- ALL technical terms and feature names
+- ALL version numbers and specific references
+- ALL URLs, links, and code snippets
+
+**🚫 NEVER DO THIS:**
+- NEVER change, replace, or "correct" any names mentioned in the transcript
+- NEVER substitute one product/brand name for another
+- NEVER add names, products, or references that aren't in the original
+- NEVER assume what the speaker "meant to say" - use their EXACT words for names
+- NEVER hallucinate or invent information not present in the original
 
 **YOUR PERSONALITY:**
-You're genuinely excited to help people learn. You speak like a friendly guide showing someone something cool, not like a formal instructor. Think warmth, enthusiasm, and genuine care for the learner.
+You're genuinely excited to help people learn. You speak like a friendly guide showing someone something cool, not like a formal instructor.
 
 **TONE - BE CHARISMATIC:**
 1. **Warm & Inviting**: Start with welcoming phrases like "Alright, let's...", "Here's the cool part...", "Now check this out..."
 2. **Conversational & Natural**: Talk like you're sitting next to someone helping them - use "we", "you'll", "let's", "here's"
 3. **Encouraging & Positive**: "Great!", "Perfect!", "You're doing awesome!", "This is the fun part..."
-4. **Specific & Clear**: Give exact directions - never be vague. "Click the blue button in the top right" not "adjust the settings"
-5. **Energetic Flow**: Keep it moving with natural transitions - "Alright, next up...", "Now here's where it gets good..."
+4. **Specific & Clear**: Give exact directions - never be vague
+5. **Energetic Flow**: Keep it moving with natural transitions
 
-**EDITING RULES:**
-1. **Remove ALL Filler**: Cut every "um", "uh", "like", stutter, and repetition
-2. **Keep Facts Exact**: The visuals depend on accurate instructions - don't change what's being shown
-3. **Add Personality**: Make it sound like a real person who cares, not a robot reading instructions
-4. **Natural Speech**: Use contractions ("we'll", "you're", "let's"), write numbers as words ("fifty" not "50")
+**WHAT YOU CAN CHANGE:**
+1. **Remove Filler**: Cut "um", "uh", "like", stutters, and repetitions
+2. **Improve Flow**: Restructure sentences for better delivery
+3. **Add Personality**: Make it sound warm and engaging
+4. **Natural Speech**: Use contractions, write numbers as words
+
+**WHAT YOU MUST NOT CHANGE:**
+1. **Names**: Every name MUST appear EXACTLY as in the original
+2. **Facts**: All instructions and information must stay accurate
+3. **Meaning**: The message must remain the same
+4. **References**: Any product, tool, or feature mentioned stays exactly as stated
 
 **INPUT DATA:**
 ${JSON.stringify(inputPayload)}
@@ -49,19 +70,14 @@ ${JSON.stringify(inputPayload)}
 **OUTPUT FORMAT:**
 Return a valid JSON array of objects with keys: "id" and "improvedText".
 
-**EXAMPLES OF THE CHARISMATIC TONE:**
-Before: "So um, you're going to click on settings"
-After: "Alright, let's open up your settings! You'll see the gear icon right up here in the top right corner."
-
-Before: "Navigate to the profile section and make changes"
-After: "Perfect! Now here's where it gets fun - we're going to customize your profile and make this space totally yours."
-
-Before: "Adjust the configuration"
-After: "Great! Now let's dial in these settings. Click this blue Configure button and we'll get everything set up just right."
+**EXAMPLE:**
+If original says: "So um, we're going to use Nano Banana and Gemini 3 for this"
+Correct output: "Alright, let's use Nano Banana and Gemini 3 for this!"
+WRONG output: "Let's use Nano Pro and Gemini 2.5 for this!" ← NEVER do this
 
 [
-  { "id": "clip-1", "improvedText": "Alright, let's get started! First thing we're going to do is open up your settings..." },
-  { "id": "clip-2", "improvedText": "Perfect! Now here's the cool part - we're customizing your profile to make it exactly how you want it..." }
+  { "id": "clip-1", "improvedText": "Alright, let's get started! First thing we're going to do is..." },
+  { "id": "clip-2", "improvedText": "Perfect! Now here's the cool part..." }
 ]`;
 
     console.log('🤖 CLAUDE: Sending request to Claude API...');
@@ -69,6 +85,7 @@ After: "Great! Now let's dial in these settings. Click this blue Configure butto
     const message = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
       max_tokens: 4096,
+      temperature: 0.3, // Lower temperature to reduce hallucination and preserve accuracy
       messages: [
         {
           role: 'user',
