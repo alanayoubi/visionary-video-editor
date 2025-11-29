@@ -1,5 +1,6 @@
 import { supabase } from './supabaseClient';
 import { AppSettings, Clip, Message, TimelineEvent } from '../types';
+import { deleteVideoFromBunny, extractBunnyVideoId } from './bunnyService';
 
 export const PROJECT_BUCKET = 'project-uploads';
 
@@ -237,4 +238,84 @@ export const clearProjectMasterAudio = async (projectId: string) => {
     .eq('id', projectId);
 
   if (error) throw error;
+};
+
+/**
+ * Completely delete a project and all associated resources
+ * - Deletes project state from project_states table
+ * - Deletes assets from Supabase storage (if stored there)
+ * - Deletes video from Bunny CDN (if stored there)
+ * - Deletes the project from projects table
+ */
+export const deleteProject = async (projectId: string): Promise<void> => {
+  // First, get the project to retrieve video storage info
+  const { data: project, error: fetchError } = await supabase
+    .from('projects')
+    .select('*')
+    .eq('id', projectId)
+    .single();
+
+  if (fetchError) throw fetchError;
+
+  // Delete video from Bunny CDN if applicable
+  if (project.video_storage_path) {
+    const bunnyVideoId = extractBunnyVideoId(project.video_storage_path);
+    if (bunnyVideoId) {
+      try {
+        await deleteVideoFromBunny(bunnyVideoId);
+        console.log(`Deleted Bunny video: ${bunnyVideoId}`);
+      } catch (bunnyError) {
+        console.error('Failed to delete Bunny video:', bunnyError);
+        // Continue with project deletion even if Bunny delete fails
+      }
+    }
+  }
+
+  // Delete assets from Supabase storage bucket
+  try {
+    // List all files in the project folder
+    const { data: files, error: listError } = await supabase
+      .storage
+      .from(PROJECT_BUCKET)
+      .list(projectId);
+
+    if (!listError && files && files.length > 0) {
+      // Delete each subfolder and its contents
+      for (const item of files) {
+        if (item.name) {
+          // List files in subfolder
+          const { data: subFiles } = await supabase
+            .storage
+            .from(PROJECT_BUCKET)
+            .list(`${projectId}/${item.name}`);
+
+          if (subFiles && subFiles.length > 0) {
+            const filePaths = subFiles.map(f => `${projectId}/${item.name}/${f.name}`);
+            await supabase.storage.from(PROJECT_BUCKET).remove(filePaths);
+          }
+        }
+      }
+    }
+  } catch (storageError) {
+    console.error('Failed to delete storage assets:', storageError);
+    // Continue with project deletion even if storage cleanup fails
+  }
+
+  // Delete project state
+  const { error: stateDeleteError } = await supabase
+    .from('project_states')
+    .delete()
+    .eq('project_id', projectId);
+
+  if (stateDeleteError) {
+    console.error('Failed to delete project state:', stateDeleteError);
+  }
+
+  // Delete the project record
+  const { error: projectDeleteError } = await supabase
+    .from('projects')
+    .delete()
+    .eq('id', projectId);
+
+  if (projectDeleteError) throw projectDeleteError;
 };

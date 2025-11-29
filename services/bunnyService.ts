@@ -203,3 +203,30 @@ export const isBunnyConfigured = (): boolean => {
   return !!(BUNNY_API_KEY && BUNNY_LIBRARY_ID && BUNNY_CDN_HOSTNAME);
 };
 
+/**
+ * Extract video ID from a Bunny CDN URL
+ * URL format: https://{hostname}.b-cdn.net/{videoId}/play_720p.mp4
+ */
+export const extractBunnyVideoId = (url: string): string | null => {
+  if (!url || !url.includes('b-cdn.net')) {
+    return null;
+  }
+  
+  try {
+    const urlObj = new URL(url);
+    const pathParts = urlObj.pathname.split('/').filter(Boolean);
+    // The video ID is the first path segment (e.g., /videoId/play_720p.mp4)
+    if (pathParts.length >= 1) {
+      return pathParts[0];
+    }
+  } catch {
+    // If URL parsing fails, try regex fallback
+    const match = url.match(/b-cdn\.net\/([a-zA-Z0-9-]+)/);
+    if (match) {
+      return match[1];
+    }
+  }
+  
+  return null;
+};
+

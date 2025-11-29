@@ -1,5 +1,11 @@
 
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+// Modular Timeline Components with Zustand stores
+import { 
+  Timeline, 
+  usePlaybackStore,
+  useKeyboardShortcuts 
+} from './components/advanced-timeline';
 import { APP_NAME, MAX_VIDEO_SIZE_MB, LOOM_APP_ID } from './constants';
 import { generateId, getYouTubeId, getLoomId, parseTime, formatTime, base64ToArrayBuffer, audioBufferToWav } from './utils';
 import { sendMessageToGemini, uploadMedia, generateVideoTimeline, detectSilenceAndInactivity, validateAndRepairTimeline } from './services/geminiService';
@@ -20,7 +26,8 @@ import {
   clearProjectMasterAudio,
   getAssetPublicUrl,
   touchProject,
-  bumpProjectUpdatedAt
+  bumpProjectUpdatedAt,
+  deleteProject
 } from './services/projectService';
 import { loadUserSettings, saveElevenLabsApiKey } from './services/userSettingsService';
 import { uploadVideoToBunny, isBunnyConfigured, BunnyUploadProgress } from './services/bunnyService';
@@ -284,7 +291,9 @@ function AuthenticatedApp() {
   const [exportProgress, setExportProgress] = useState(0);
   const [exportMessage, setExportMessage] = useState("Initializing...");
 
-
+  // Delete Project State
+  const [projectToDelete, setProjectToDelete] = useState<ProjectRecord | null>(null);
+  const [isDeletingProject, setIsDeletingProject] = useState(false);
 
   const refreshProjectList = useCallback(async () => {
       try {
@@ -448,6 +457,22 @@ function AuthenticatedApp() {
       refreshProjectList();
   }, [refreshProjectList]);
 
+  const handleDeleteProject = useCallback(async () => {
+      if (!projectToDelete) return;
+      
+      try {
+          setIsDeletingProject(true);
+          await deleteProject(projectToDelete.id);
+          setProjectToDelete(null);
+          refreshProjectList();
+      } catch (error: any) {
+          console.error('Failed to delete project', error);
+          setProjectError(`Failed to delete project: ${error.message || 'Unknown error'}`);
+      } finally {
+          setIsDeletingProject(false);
+      }
+  }, [projectToDelete, refreshProjectList]);
+
   const projectReady = !!activeProjectId && projectInitialized;
 
   const invalidateMasterAudio = useCallback(() => {
@@ -511,11 +536,24 @@ function AuthenticatedApp() {
   // Lock to prevent multi-firing transitions
   const isTransitioningRef = useRef(false);
 
-  // Derived state for total edited video duration
-  const totalSequenceDuration = clips.reduce((acc, c) => acc + getClipDuration(c), 0);
+  // PERFORMANCE: Memoized derived state calculations
+  // These prevent expensive recalculations on every render
+  const totalSequenceDuration = useMemo(() => 
+    clips.reduce((acc, c) => acc + getClipDuration(c), 0), 
+    [clips]
+  );
+
+  // PERFORMANCE: Memoize max end time - used in many places
+  const maxEndTime = useMemo(() => 
+    clips.length > 0 ? Math.max(...clips.map(c => c.endTime)) : 60, 
+    [clips]
+  );
 
   // Check if we have polished scripts that need audio
-  const hasPolishedScripts = clips.some(c => c.improvedTranscript);
+  const hasPolishedScripts = useMemo(() => 
+    clips.some(c => c.improvedTranscript), 
+    [clips]
+  );
   const audioGenerated = !!masterAudioUrl;
   
   // Show banner if we have polished scripts AND audio is NOT generated yet
@@ -719,6 +757,86 @@ function AuthenticatedApp() {
           if (masterAudioUrl) vid.pause();
       }
   }, [isPlaying, masterAudioUrl]); 
+
+  // --- PERFORMANCE: 60fps Playhead Update Loop ---
+  // This replaces the laggy timeupdate events with smooth requestAnimationFrame updates
+  // Similar to how Remotion achieves smooth playhead sync
+  useEffect(() => {
+      const vid = videoRef.current;
+      const aud = audioPlayerRef.current;
+      if (!vid || !video || clips.length === 0) return;
+      
+      let animationFrameId: number;
+      let lastUpdateTime = 0;
+      const FPS_60_INTERVAL = 1000 / 60; // ~16.67ms
+      
+      const updatePlayhead = () => {
+          const now = performance.now();
+          
+          // Throttle to 60fps to prevent excessive state updates
+          if (now - lastUpdateTime >= FPS_60_INTERVAL) {
+              lastUpdateTime = now;
+              
+              if (masterAudioUrl && aud) {
+                  // MASTER AUDIO MODE: Calculate position from audio
+                  const audioTime = aud.currentTime;
+                  const currentClipIndex = clips.findIndex(c => 
+                      c.audioStartTime !== undefined && 
+                      c.audioEndTime !== undefined && 
+                      audioTime >= c.audioStartTime && 
+                      audioTime < c.audioEndTime
+                  );
+                  
+                  if (currentClipIndex !== -1) {
+                      const currentClip = clips[currentClipIndex];
+                      const audioDuration = (currentClip.audioEndTime! - currentClip.audioStartTime!);
+                      const relativeAudioTime = audioTime - currentClip.audioStartTime!;
+                      
+                      // Calculate accumulated time for progress bar
+                      let accumulatedDuration = 0;
+                      for(let i = 0; i < currentClipIndex; i++) {
+                          accumulatedDuration += getClipDuration(clips[i]);
+                      }
+                      
+                      // Smoothly update sequence time
+                      setCurrentSequenceTime(accumulatedDuration + relativeAudioTime);
+                  }
+              } else {
+                  // LEGACY VIDEO MODE: Calculate position from video
+                  const currentClipIndex = clips.findIndex(c => c.id === activeClipId);
+                  if (currentClipIndex !== -1) {
+                      const currentClip = clips[currentClipIndex];
+                      const vidTime = vid.currentTime;
+                      const clipProgress = Math.max(0, vidTime - currentClip.startTime);
+                      
+                      // Calculate accumulated time
+                      let accumulated = 0;
+                      for(let i = 0; i < currentClipIndex; i++) {
+                          accumulated += getClipDuration(clips[i]);
+                      }
+                      
+                      setCurrentSequenceTime(accumulated + clipProgress);
+                  }
+              }
+          }
+          
+          // Continue the loop only while playing
+          if (isPlaying) {
+              animationFrameId = requestAnimationFrame(updatePlayhead);
+          }
+      };
+      
+      // Start the RAF loop when playing
+      if (isPlaying) {
+          animationFrameId = requestAnimationFrame(updatePlayhead);
+      }
+      
+      return () => {
+          if (animationFrameId) {
+              cancelAnimationFrame(animationFrameId);
+          }
+      };
+  }, [isPlaying, masterAudioUrl, clips, activeClipId, video]); 
 
   // --- Canvas Recorder Export Handler ---
   const handleExport = async () => {
@@ -1507,12 +1625,13 @@ function AuthenticatedApp() {
     }
   };
 
-  const togglePlayback = () => {
+  // PERFORMANCE: Memoized playback handlers
+  const togglePlayback = useCallback(() => {
     if (clips.length === 0) return;
-    setIsPlaying(!isPlaying);
-  };
+    setIsPlaying(prev => !prev);
+  }, [clips.length]);
 
-  const skipClip = (direction: 'next' | 'prev') => {
+  const skipClip = useCallback((direction: 'next' | 'prev') => {
       const idx = clips.findIndex(c => c.id === activeClipId);
       if (idx === -1) return;
       
@@ -1527,21 +1646,26 @@ function AuthenticatedApp() {
                videoRef.current.currentTime = nextClip.startTime;
           }
       }
-  };
+  }, [clips, activeClipId, masterAudioUrl]);
 
-  const moveClip = (index: number, direction: 'left' | 'right') => {
-      const newClips = [...clips];
+  // PERFORMANCE: Memoized clip manipulation handlers
+  const moveClip = useCallback((index: number, direction: 'left' | 'right') => {
+      setClips(prevClips => {
+          const newClips = [...prevClips];
       const targetIndex = direction === 'left' ? index - 1 : index + 1;
       if (targetIndex >= 0 && targetIndex < newClips.length) {
           [newClips[index], newClips[targetIndex]] = [newClips[targetIndex], newClips[index]];
-          setClips(newClips);
-          invalidateMasterAudio(); // Invalidate audio order
-      }
-  };
+              return newClips;
+          }
+          return prevClips;
+      });
+      invalidateMasterAudio(); // Invalidate audio order
+  }, [invalidateMasterAudio]);
 
-  const deleteClip = (id: string) => {
-    const currentIndex = clips.findIndex(c => c.id === id);
-    const newClips = clips.filter(c => c.id !== id);
+  const deleteClip = useCallback((id: string) => {
+    setClips(prevClips => {
+        const currentIndex = prevClips.findIndex(c => c.id === id);
+        const newClips = prevClips.filter(c => c.id !== id);
     
     if (activeClipId === id) {
         if (newClips.length > 0) {
@@ -1553,9 +1677,10 @@ function AuthenticatedApp() {
             setIsPlaying(false);
         }
     }
-    setClips(newClips);
+        return newClips;
+    });
     invalidateMasterAudio(); // Invalidate audio
-  };
+  }, [activeClipId, invalidateMasterAudio]);
 
   const fixRedundancy = (clipId: string, event: TimelineEvent) => {
       const clip = clips.find(c => c.id === clipId);
@@ -1608,7 +1733,7 @@ function AuthenticatedApp() {
       invalidateMasterAudio(); // Invalidate audio
   };
 
-  const splitClipAtPlayhead = () => {
+  const splitClipAtPlayhead = useCallback(() => {
     if (!videoRef.current || !activeClipId) return;
     const currentTime = videoRef.current.currentTime;
     const clipIndex = clips.findIndex(c => c.id === activeClipId);
@@ -1628,15 +1753,15 @@ function AuthenticatedApp() {
     } else {
         alert("Playhead must be inside the active clip to split.");
     }
-  };
+  }, [activeClipId, clips, invalidateMasterAudio]);
 
   // --- TRANSCRIPT EDITING HANDLERS ---
-  const handleStartEdit = (clip: Clip) => {
+  const handleStartEdit = useCallback((clip: Clip) => {
     setEditingClipId(clip.id);
     setEditingText(clip.improvedTranscript || clip.transcript || "");
-  };
+  }, []);
 
-  const handleSaveEdit = () => {
+  const handleSaveEdit = useCallback(() => {
     if (!editingClipId) return;
 
     setClips(prevClips => prevClips.map(c => 
@@ -1646,14 +1771,63 @@ function AuthenticatedApp() {
     // Invalidate audio because text changed
     invalidateMasterAudio();
     setEditingClipId(null);
-  };
+  }, [editingClipId, editingText, invalidateMasterAudio]);
 
-  const handleCancelEdit = () => {
+  const handleCancelEdit = useCallback(() => {
     setEditingClipId(null);
     setEditingText("");
-  };
+  }, []);
 
-  const handleGlobalSeek = (e: React.MouseEvent<HTMLDivElement>) => {
+  // PERFORMANCE: Handler for memoized clip selection
+  const handleClipSelect = useCallback((id: string, startTime: number) => {
+    setActiveClipId(id);
+    setIsPlaying(false);
+    if (videoRef.current) videoRef.current.currentTime = startTime;
+  }, []);
+
+  // SYNC: Handler for Timeline seek - converts raw video time to sequence time
+  const handleTimelineSeek = useCallback((rawVideoTime: number, clipId: string | null, clipStartTime: number) => {
+    // Stop playing when seeking
+    setIsPlaying(false);
+    
+    // Find which clip contains this raw video time and calculate sequence position
+    let accumulatedSequenceTime = 0;
+    
+    for (const clip of clips) {
+      const clipDuration = getClipDuration(clip);
+      
+      // Check if rawVideoTime falls within this clip's video boundaries
+      if (rawVideoTime >= clip.startTime && rawVideoTime < clip.endTime) {
+        // Calculate how far into this clip the seek position is
+        const offsetInClip = rawVideoTime - clip.startTime;
+        // Set sequence time = accumulated time from previous clips + offset in current clip
+        setCurrentSequenceTime(accumulatedSequenceTime + offsetInClip);
+        return;
+      }
+      
+      accumulatedSequenceTime += clipDuration;
+    }
+    
+    // If no clip contains this time (clicked outside clip regions), 
+    // estimate based on closest position
+    if (clips.length > 0) {
+      // Before first clip - set to 0
+      if (rawVideoTime < clips[0].startTime) {
+        setCurrentSequenceTime(0);
+      } else {
+        // After last clip - set to total duration
+        setCurrentSequenceTime(totalSequenceDuration);
+      }
+    }
+  }, [clips, totalSequenceDuration]);
+
+  // PERFORMANCE: Handler for editing text change
+  const handleEditTextChange = useCallback((text: string) => {
+    setEditingText(text);
+  }, []);
+
+  // PERFORMANCE: Memoized seek handler
+  const handleGlobalSeek = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
       if (clips.length === 0 || !videoRef.current) return;
 
       isTransitioningRef.current = true; // Lock during manual seek
@@ -1690,7 +1864,7 @@ function AuthenticatedApp() {
       
       // Fallback
       setTimeout(() => { isTransitioningRef.current = false; }, 100);
-  };
+  }, [clips, totalSequenceDuration, masterAudioUrl]);
 
   const renderMessageText = (text: string) => {
     const html = marked(text, { breaks: true });
@@ -1721,7 +1895,37 @@ function AuthenticatedApp() {
     return () => window.removeEventListener('jumpTime', handleJump);
   }, [clips]);
 
-  const activeClipIndex = clips.findIndex(c => c.id === activeClipId);
+  // PERFORMANCE: Memoize active clip index
+  const activeClipIndex = useMemo(() => 
+    clips.findIndex(c => c.id === activeClipId), 
+    [clips, activeClipId]
+  );
+
+  // PERFORMANCE: Keyboard shortcuts for timeline/video controls
+  useKeyboardShortcuts({
+    videoRef,
+    seekAmount: 5,
+  });
+
+  // Spacebar shortcut for play/pause
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Don't trigger if user is typing in an input/textarea
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
+        return;
+      }
+      
+      if (e.code === 'Space') {
+        e.preventDefault();
+        if (clips.length > 0) {
+          setIsPlaying(prev => !prev);
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [clips.length]);
 
   if (!projectReady) {
       return (
@@ -1766,12 +1970,26 @@ function AuthenticatedApp() {
                   ) : (
                       <div className="grid gap-4 md:grid-cols-2">
                           {projects.map(project => (
-                              <button
+                              <div
                                   key={project.id}
+                                  className="relative group border border-zinc-800 rounded-2xl p-4 bg-zinc-900/70 text-left hover:border-indigo-500 transition cursor-pointer"
                                   onClick={() => handleOpenProject(project.id)}
-                                  className="border border-zinc-800 rounded-2xl p-4 bg-zinc-900/70 text-left hover:border-indigo-500 transition"
                               >
-                                  <div className="flex items-center justify-between mb-2">
+                                  {/* Delete Button */}
+                                  <button
+                                      onClick={(e) => {
+                                          e.stopPropagation();
+                                          setProjectToDelete(project);
+                                      }}
+                                      className="absolute top-3 right-3 p-1.5 rounded-lg bg-zinc-800/80 text-zinc-400 opacity-0 group-hover:opacity-100 hover:bg-rose-500/20 hover:text-rose-400 transition-all"
+                                      title="Delete project"
+                                  >
+                                      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
+                                          <path fillRule="evenodd" d="M8.75 1A2.75 2.75 0 006 3.75v.443c-.795.077-1.584.176-2.365.298a.75.75 0 10.23 1.482l.149-.022.841 10.518A2.75 2.75 0 007.596 19h4.807a2.75 2.75 0 002.742-2.53l.841-10.519.149.023a.75.75 0 00.23-1.482A41.03 41.03 0 0014 4.193V3.75A2.75 2.75 0 0011.25 1h-2.5zM10 4c.84 0 1.673.025 2.5.075V3.75c0-.69-.56-1.25-1.25-1.25h-2.5c-.69 0-1.25.56-1.25 1.25v.325C8.327 4.025 9.16 4 10 4zM8.58 7.72a.75.75 0 00-1.5.06l.3 7.5a.75.75 0 101.5-.06l-.3-7.5zm4.34.06a.75.75 0 10-1.5-.06l-.3 7.5a.75.75 0 101.5.06l.3-7.5z" clipRule="evenodd" />
+                                      </svg>
+                                  </button>
+                                  
+                                  <div className="flex items-center justify-between mb-2 pr-8">
                                       <h3 className="text-lg font-semibold text-white">{project.name}</h3>
                                       <span className={`text-xs px-2 py-0.5 rounded-full ${project.videoFileName ? 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/30' : 'bg-zinc-800 text-zinc-400 border border-zinc-700'}`}>
                                           {project.videoFileName ? 'Video attached' : 'Awaiting upload'}
@@ -1787,11 +2005,68 @@ function AuthenticatedApp() {
                                           </span>
                                       </div>
                                   </div>
-                              </button>
+                              </div>
                           ))}
                       </div>
                   )}
               </div>
+
+              {/* Delete Confirmation Modal */}
+              {projectToDelete && (
+                  <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+                      <div className="bg-zinc-900 border border-zinc-800 p-6 rounded-2xl w-full max-w-md shadow-2xl">
+                          <div className="flex items-center gap-3 mb-4">
+                              <div className="p-2 rounded-full bg-rose-500/10">
+                                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-6 h-6 text-rose-400">
+                                      <path fillRule="evenodd" d="M12 2.25c-5.385 0-9.75 4.365-9.75 9.75s4.365 9.75 9.75 9.75 9.75-4.365 9.75-9.75S17.385 2.25 12 2.25zm-1.72 6.97a.75.75 0 10-1.06 1.06L10.94 12l-1.72 1.72a.75.75 0 101.06 1.06L12 13.06l1.72 1.72a.75.75 0 101.06-1.06L13.06 12l1.72-1.72a.75.75 0 10-1.06-1.06L12 10.94l-1.72-1.72z" clipRule="evenodd" />
+                                  </svg>
+                              </div>
+                              <h2 className="text-lg font-bold text-white">Delete Project</h2>
+                          </div>
+                          
+                          <p className="text-zinc-400 text-sm mb-2">
+                              Are you sure you want to delete <span className="text-white font-semibold">"{projectToDelete.name}"</span>?
+                          </p>
+                          <p className="text-zinc-500 text-xs mb-6">
+                              This action cannot be undone. All project data, clips, and the associated video will be permanently deleted.
+                          </p>
+                          
+                          {projectToDelete.videoFileName && (
+                              <div className="mb-6 p-3 bg-zinc-800/50 rounded-lg border border-zinc-700">
+                                  <p className="text-xs text-zinc-400 mb-1">Video to be deleted:</p>
+                                  <p className="text-sm text-white truncate">{projectToDelete.videoFileName}</p>
+                              </div>
+                          )}
+                          
+                          <div className="flex gap-3">
+                              <button
+                                  onClick={() => setProjectToDelete(null)}
+                                  disabled={isDeletingProject}
+                                  className="flex-1 px-4 py-2.5 rounded-xl border border-zinc-700 text-zinc-300 hover:bg-zinc-800 transition disabled:opacity-50"
+                              >
+                                  Cancel
+                              </button>
+                              <button
+                                  onClick={handleDeleteProject}
+                                  disabled={isDeletingProject}
+                                  className="flex-1 px-4 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-medium transition disabled:opacity-50 flex items-center justify-center gap-2"
+                              >
+                                  {isDeletingProject ? (
+                                      <>
+                                          <svg className="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                          </svg>
+                                          Deleting...
+                                      </>
+                                  ) : (
+                                      'Delete Project'
+                                  )}
+                              </button>
+                          </div>
+                      </div>
+                  </div>
+              )}
           </div>
       );
   }
@@ -2071,11 +2346,23 @@ function AuthenticatedApp() {
                           >
                              <div 
                                 className="absolute top-0 left-0 h-full bg-indigo-500 rounded-full" 
-                                style={{ width: `${(currentSequenceTime / totalSequenceDuration) * 100}%` }}
+                                style={{ 
+                                    width: totalSequenceDuration > 0 
+                                        ? `${(currentSequenceTime / totalSequenceDuration) * 100}%` 
+                                        : '0%',
+                                    willChange: isPlaying ? 'width' : 'auto',
+                                    transition: isPlaying ? 'none' : 'width 0.05s ease-out'
+                                }}
                              ></div>
                              <div 
-                                className="absolute top-1/2 -translate-y-1/2 w-3.5 h-3.5 bg-white rounded-full shadow-md scale-0 group-hover/bar:scale-100 transition-transform" 
-                                style={{ left: `${(currentSequenceTime / totalSequenceDuration) * 100}%` }}
+                                className="absolute top-1/2 -translate-y-1/2 w-3.5 h-3.5 bg-white rounded-full shadow-md scale-0 group-hover/bar:scale-100" 
+                                style={{ 
+                                    left: totalSequenceDuration > 0 
+                                        ? `${(currentSequenceTime / totalSequenceDuration) * 100}%` 
+                                        : '0%',
+                                    willChange: isPlaying ? 'left' : 'auto',
+                                    transition: isPlaying ? 'none, transform 0.2s' : 'left 0.05s ease-out, transform 0.2s'
+                                }}
                              ></div>
                           </div>
 
@@ -2214,390 +2501,26 @@ function AuthenticatedApp() {
                         </div>
                     </div>
 
-                    {/* Time Ruler - Clickable for seeking */}
-                    <div className="h-6 bg-[#16161a] border-b border-zinc-800/30 flex">
-                        <div className="w-28 shrink-0"></div>
-                        <div 
-                            className="flex-1 overflow-hidden relative cursor-pointer"
-                            onClick={(e) => {
-                                if (!video || !videoRef.current) return;
-                                const rect = e.currentTarget.getBoundingClientRect();
-                                const clickX = e.clientX - rect.left;
-                                const percentage = clickX / rect.width;
-                                const totalDuration = Math.max(...clips.map(c => c.endTime), 60);
-                                const newTime = percentage * totalDuration;
-                                
-                                // Find clip at this time
-                                const clipAtTime = clips.find(c => newTime >= c.startTime && newTime < c.endTime);
-                                if (clipAtTime) {
-                                    setActiveClipId(clipAtTime.id);
-                                    const offsetInClip = newTime - clipAtTime.startTime;
-                                    
-                                    // Sync audio if master audio exists
-                                    if (masterAudioUrl && clipAtTime.audioStartTime !== undefined && audioPlayerRef.current) {
-                                        const audioDuration = (clipAtTime.audioEndTime! - clipAtTime.audioStartTime!);
-                                        const videoDuration = (clipAtTime.endTime - clipAtTime.startTime);
-                                        const audioOffset = (offsetInClip / videoDuration) * audioDuration;
-                                        audioPlayerRef.current.currentTime = clipAtTime.audioStartTime + audioOffset;
-                                    }
-                                }
-                                
-                                videoRef.current.currentTime = Math.max(0, Math.min(newTime, totalDuration));
-                                setIsPlaying(false);
-                            }}
-                        >
-                            <div className="absolute inset-0 flex items-center pointer-events-none">
-                                {(() => {
-                                    const totalDuration = clips.length > 0 ? Math.max(...clips.map(c => c.endTime)) : 60;
-                                    const intervals = Math.ceil(totalDuration / 10);
-                                    return Array.from({ length: intervals + 1 }, (_, i) => (
-                                        <div key={i} className="flex items-center" style={{ minWidth: '80px' }}>
-                                            <div className="flex flex-col items-start">
-                                                <span className="text-[9px] font-mono text-zinc-500">{formatTime(i * 10)}</span>
-                                            </div>
-                                            <div className="flex-1 flex items-center gap-[7px] ml-1">
-                                                {Array.from({ length: 9 }, (_, j) => (
-                                                    <div key={j} className="w-px h-1.5 bg-zinc-700/50"></div>
-                                                ))}
-                                            </div>
-                                        </div>
-                                    ));
-                                })()}
-                            </div>
-                            {/* Playhead on ruler - Draggable */}
-                            {video && videoRef.current && (
-                                <div 
-                                    className="absolute top-0 bottom-0 w-3 z-20 cursor-grab active:cursor-grabbing group"
-                                    style={{ 
-                                        left: `calc(${(videoRef.current.currentTime / Math.max(...clips.map(c => c.endTime), 60)) * 100}% - 6px)`,
-                                        transition: isPlaying ? 'none' : 'left 0.05s ease-out'
-                                    }}
-                                    onMouseDown={(e) => {
-                                        e.preventDefault();
-                                        e.stopPropagation();
-                                        const container = e.currentTarget.parentElement;
-                                        if (!container || !videoRef.current) return;
-                                        
-                                        const totalDuration = Math.max(...clips.map(c => c.endTime), 60);
-                                        const wasPlaying = isPlaying;
-                                        setIsPlaying(false);
-                                        
-                                        const handleMouseMove = (moveEvent: MouseEvent) => {
-                                            const rect = container.getBoundingClientRect();
-                                            const mouseX = moveEvent.clientX - rect.left;
-                                            const percentage = Math.max(0, Math.min(1, mouseX / rect.width));
-                                            const newTime = percentage * totalDuration;
-                                            
-                                            if (videoRef.current) {
-                                                videoRef.current.currentTime = newTime;
-                                            }
-                                            
-                                            // Update active clip and sync audio while dragging
-                                            const clipAtTime = clips.find(c => newTime >= c.startTime && newTime < c.endTime);
-                                            if (clipAtTime) {
-                                                setActiveClipId(clipAtTime.id);
-                                                const offsetInClip = newTime - clipAtTime.startTime;
-                                                
-                                                // Sync audio if master audio exists
-                                                if (masterAudioUrl && clipAtTime.audioStartTime !== undefined && audioPlayerRef.current) {
-                                                    const audioDuration = (clipAtTime.audioEndTime! - clipAtTime.audioStartTime!);
-                                                    const videoDuration = (clipAtTime.endTime - clipAtTime.startTime);
-                                                    const audioOffset = (offsetInClip / videoDuration) * audioDuration;
-                                                    audioPlayerRef.current.currentTime = clipAtTime.audioStartTime + audioOffset;
-                                                }
-                                            }
-                                        };
-                                        
-                                        const handleMouseUp = () => {
-                                            document.removeEventListener('mousemove', handleMouseMove);
-                                            document.removeEventListener('mouseup', handleMouseUp);
-                                            document.body.style.cursor = '';
-                                            document.body.style.userSelect = '';
-                                        };
-                                        
-                                        document.body.style.cursor = 'grabbing';
-                                        document.body.style.userSelect = 'none';
-                                        document.addEventListener('mousemove', handleMouseMove);
-                                        document.addEventListener('mouseup', handleMouseUp);
-                                    }}
-                                >
-                                    {/* Playhead line */}
-                                    <div className="absolute left-1/2 -translate-x-1/2 top-0 bottom-0 w-0.5 bg-orange-500"></div>
-                                    {/* Playhead handle */}
-                                    <div className="absolute left-1/2 -translate-x-1/2 -top-1 w-3 h-4 bg-orange-500 rounded-b-sm flex items-start justify-center shadow-lg group-hover:bg-orange-400 transition-colors">
-                                        <div className="w-1.5 h-1.5 mt-0.5 rounded-full bg-orange-200/50"></div>
-                                    </div>
-                                </div>
-                            )}
-                        </div>
-                    </div>
-
-                    {/* Timeline Tracks Container */}
-                    <div className="flex-1 flex overflow-hidden" style={{ height: '180px' }}>
-                        {/* Track Labels */}
-                        <div className="w-28 shrink-0 bg-[#16161a] border-r border-zinc-800/30 flex flex-col">
-                            {/* Transcript Track Label */}
-                            <div className="h-14 flex items-center px-3 border-b border-zinc-800/30">
-                                <div className="flex items-center gap-2">
-                                    <span className="text-[10px] font-bold text-violet-400 uppercase tracking-wider">CLIPS</span>
-                                    <div className="flex gap-1">
-                                        <button className="w-4 h-4 rounded bg-zinc-800 flex items-center justify-center hover:bg-zinc-700">
-                                            <svg className="w-2 h-2 text-zinc-400" fill="currentColor" viewBox="0 0 8 8"><circle cx="4" cy="4" r="3"/></svg>
-                                        </button>
-                                    </div>
-                                </div>
-                            </div>
-                            {/* Polished Track Label */}
-                            <div className="h-14 flex items-center px-3 border-b border-zinc-800/30">
-                                <div className="flex items-center gap-2">
-                                    <span className="text-[10px] font-bold text-cyan-400 uppercase tracking-wider">POLISHED</span>
-                                </div>
-                            </div>
-                            {/* Issues Track Label */}
-                            <div className="flex-1 flex items-center px-3">
-                                <span className="text-[10px] font-bold text-amber-400/70 uppercase tracking-wider">ISSUES</span>
-                            </div>
-                        </div>
-
-                        {/* Tracks Content */}
-                        <div 
-                            className="flex-1 overflow-x-auto overflow-y-hidden scrollbar-thin scrollbar-thumb-zinc-700 scrollbar-track-transparent relative"
-                            onClick={(e) => {
-                                // Only seek if clicking on the background, not on clips
-                                if ((e.target as HTMLElement).closest('[data-clip]')) return;
-                                if (!video || !videoRef.current) return;
-                                const rect = e.currentTarget.getBoundingClientRect();
-                                const clickX = e.clientX - rect.left + e.currentTarget.scrollLeft;
-                                const totalWidth = e.currentTarget.scrollWidth;
-                                const percentage = clickX / totalWidth;
-                                const totalDuration = Math.max(...clips.map(c => c.endTime), 60);
-                                const newTime = percentage * totalDuration;
-                                
-                                // Find clip at this time and sync audio
-                                const clipAtTime = clips.find(c => newTime >= c.startTime && newTime < c.endTime);
-                                if (clipAtTime) {
-                                    setActiveClipId(clipAtTime.id);
-                                    const offsetInClip = newTime - clipAtTime.startTime;
-                                    
-                                    // Sync audio if master audio exists
-                                    if (masterAudioUrl && clipAtTime.audioStartTime !== undefined && audioPlayerRef.current) {
-                                        const audioDuration = (clipAtTime.audioEndTime! - clipAtTime.audioStartTime!);
-                                        const videoDuration = (clipAtTime.endTime - clipAtTime.startTime);
-                                        const audioOffset = (offsetInClip / videoDuration) * audioDuration;
-                                        audioPlayerRef.current.currentTime = clipAtTime.audioStartTime + audioOffset;
-                                    }
-                                }
-                                
-                                videoRef.current.currentTime = Math.max(0, Math.min(newTime, totalDuration));
-                                setIsPlaying(false);
-                            }}
-                        >
-                            {/* Playhead Line - Full height */}
-                            {video && videoRef.current && (
-                                <div 
-                                    className="absolute top-0 bottom-0 w-0.5 bg-orange-500 z-30 pointer-events-none shadow-[0_0_8px_rgba(249,115,22,0.5)]"
-                                    style={{ 
-                                        left: `${(videoRef.current.currentTime / Math.max(...clips.map(c => c.endTime), 60)) * 100}%`,
-                                        transition: isPlaying ? 'none' : 'left 0.05s ease-out'
-                                    }}
-                                ></div>
-                            )}
-                            
-                            <div className="min-w-max h-full flex flex-col">
-                                {/* Transcript Clips Track */}
-                                <div className="h-14 border-b border-zinc-800/30 flex items-center px-2 gap-1 relative bg-[#1a1a1f]">
-                                    {clips.map((clip, index) => {
-                                        const isActive = activeClipId === clip.id;
-                                        const duration = clip.endTime - clip.startTime;
-                                        const clipWidth = Math.max(duration * 8, 60); // 8px per second, min 60px
-                                        
-                                        return (
-                                            <div 
-                                                key={clip.id}
-                                                data-clip="true"
-                                                className={`group relative h-10 rounded-md cursor-pointer overflow-hidden transition-all ${
-                                                    isActive 
-                                                        ? 'ring-2 ring-orange-500 ring-offset-1 ring-offset-[#1a1a1f] z-10' 
-                                                        : 'hover:brightness-110'
-                                                }`}
-                                                style={{ 
-                                                    width: `${clipWidth}px`,
-                                                    background: 'linear-gradient(135deg, #7c3aed 0%, #5b21b6 100%)'
-                                                }}
-                                                onClick={(e) => {
-                                                    e.stopPropagation();
-                                                    setActiveClipId(clip.id);
-                                                    setIsPlaying(false);
-                                                    if (videoRef.current) videoRef.current.currentTime = clip.startTime;
-                                                }}
-                                            >
-                                                {/* Clip Content */}
-                                                <div className="absolute inset-0 p-1.5 flex flex-col justify-between overflow-hidden">
-                                                    <div className="flex items-start justify-between gap-1">
-                                                        <span className="text-[9px] font-medium text-white/90 line-clamp-2 leading-tight flex-1">
-                                                            {clip.transcript || clip.title}
-                                                        </span>
-                                                        {/* Clip Actions */}
-                                                        <div className="flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
-                                                            <button 
-                                                                onClick={(e) => { e.stopPropagation(); moveClip(index, 'left'); }} 
-                                                                className="w-4 h-4 rounded bg-black/30 flex items-center justify-center hover:bg-black/50 text-white/70"
-                                                            >
-                                                                <ArrowLeftIcon/>
-                                                            </button>
-                                                            <button 
-                                                                onClick={(e) => { e.stopPropagation(); moveClip(index, 'right'); }} 
-                                                                className="w-4 h-4 rounded bg-black/30 flex items-center justify-center hover:bg-black/50 text-white/70"
-                                                            >
-                                                                <ArrowRightIcon/>
-                                                            </button>
-                                                            <button 
-                                                                onClick={(e) => { e.stopPropagation(); deleteClip(clip.id); }} 
-                                                                className="w-4 h-4 rounded bg-red-500/30 flex items-center justify-center hover:bg-red-500/50 text-white/70"
-                                                            >
-                                                                <TrashIcon/>
-                                                            </button>
-                                                        </div>
-                                                    </div>
-                                                    <div className="flex items-center justify-between">
-                                                        <span className="text-[8px] font-mono text-white/60">{formatTime(clip.startTime)}</span>
-                                                        <span className="text-[8px] font-mono text-white/60">{formatTime(clip.endTime)}</span>
-                                                    </div>
-                                                </div>
-                                                {/* Clip edge handles */}
-                                                <div className="absolute left-0 top-0 bottom-0 w-1 bg-violet-300/30 rounded-l-md"></div>
-                                                <div className="absolute right-0 top-0 bottom-0 w-1 bg-violet-300/30 rounded-r-md"></div>
-                                            </div>
-                                        );
-                                    })}
-                                </div>
-
-                                {/* Polished Transcript Track */}
-                                <div className="h-14 border-b border-zinc-800/30 flex items-center px-2 gap-1 relative bg-[#18181c]">
-                                    {clips.map((clip, index) => {
-                                        const isActive = activeClipId === clip.id;
-                                        const isEditing = editingClipId === clip.id;
-                                        const duration = clip.endTime - clip.startTime;
-                                        const clipWidth = Math.max(duration * 8, 60);
-                                        const hasPolished = !!clip.improvedTranscript;
-                                        
-                                        return (
-                                            <div 
-                                                key={clip.id}
-                                                data-clip="true"
-                                                className={`group relative h-10 rounded-md cursor-pointer overflow-hidden transition-all ${
-                                                    isActive 
-                                                        ? 'ring-2 ring-orange-500 ring-offset-1 ring-offset-[#18181c] z-10' 
-                                                        : 'hover:brightness-110'
-                                                } ${!hasPolished ? 'opacity-40' : ''}`}
-                                                style={{ 
-                                                    width: `${clipWidth}px`,
-                                                    background: hasPolished 
-                                                        ? 'linear-gradient(135deg, #0d9488 0%, #0f766e 100%)' 
-                                                        : 'linear-gradient(135deg, #3f3f46 0%, #27272a 100%)'
-                                                }}
-                                                onClick={(e) => {
-                                                    e.stopPropagation();
-                                                    setActiveClipId(clip.id);
-                                                    setIsPlaying(false);
-                                                    if (videoRef.current) videoRef.current.currentTime = clip.startTime;
-                                                }}
-                                            >
-                                                <div className="absolute inset-0 p-1.5 flex flex-col justify-between overflow-hidden">
-                                                    <div className="flex items-start justify-between gap-1">
-                                                        {isEditing ? (
-                                                            <div className="w-full" onClick={(e) => e.stopPropagation()}>
-                                                                <textarea
-                                                                    className="w-full h-6 bg-black/30 text-white text-[9px] p-1 rounded border border-teal-400/50 outline-none resize-none"
-                                                                    value={editingText}
-                                                                    onChange={(e) => setEditingText(e.target.value)}
-                                                                    autoFocus
-                                                                />
-                                                                <div className="flex justify-end gap-0.5 mt-0.5">
-                                                                    <button onClick={handleCancelEdit} className="p-0.5 bg-zinc-700 hover:bg-zinc-600 rounded"><XMarkIcon /></button>
-                                                                    <button onClick={handleSaveEdit} className="p-0.5 bg-teal-600 hover:bg-teal-500 rounded text-white"><CheckIcon /></button>
+                    {/* Modular Timeline Component with Zustand stores */}
+                    <Timeline
+                        clips={clips}
+                        activeClipId={activeClipId}
+                        editingClipId={editingClipId}
+                        editingText={editingText}
+                        videoRef={videoRef as React.RefObject<HTMLVideoElement>}
+                        audioRef={audioPlayerRef as React.RefObject<HTMLAudioElement>}
+                        masterAudioUrl={masterAudioUrl}
+                        onClipSelect={handleClipSelect}
+                        onClipMove={moveClip}
+                        onClipDelete={deleteClip}
+                        onStartEdit={handleStartEdit}
+                        onSaveEdit={handleSaveEdit}
+                        onCancelEdit={handleCancelEdit}
+                        onEditTextChange={handleEditTextChange}
+                        onFixRedundancy={fixRedundancy}
+                        onSeek={handleTimelineSeek}
+                    />
                                                                 </div>
-                                                            </div>
-                                                        ) : (
-                                                            <>
-                                                                <span className="text-[9px] font-medium text-white/90 line-clamp-2 leading-tight flex-1">
-                                                                    {hasPolished ? (
-                                                                        <><span className="mr-0.5">✨</span>{clip.improvedTranscript}</>
-                                                                    ) : (
-                                                                        <span className="text-zinc-400 italic">Not polished</span>
-                                                                    )}
-                                                                </span>
-                                                                {hasPolished && (
-                                                                    <button 
-                                                                        onClick={(e) => { e.stopPropagation(); handleStartEdit(clip); }}
-                                                                        className="w-4 h-4 rounded bg-black/30 flex items-center justify-center hover:bg-black/50 text-white/70 opacity-0 group-hover:opacity-100 transition-opacity shrink-0"
-                                                                    >
-                                                                        <PencilIcon />
-                                                                    </button>
-                                                                )}
-                                                            </>
-                                                        )}
-                                                    </div>
-                                                    {!isEditing && (
-                                                        <div className="flex items-center justify-between">
-                                                            {masterAudioUrl && hasPolished && (
-                                                                <div className="flex items-center gap-0.5 text-[8px] text-white/80 bg-black/20 px-1 rounded">
-                                                                    <SpeakerWaveIcon /> <span>Sync</span>
-                                                                </div>
-                                                            )}
-                                                            <span className="text-[8px] font-mono text-white/60 ml-auto">{formatTime(duration)}s</span>
-                                                        </div>
-                                                    )}
-                                                </div>
-                                                <div className="absolute left-0 top-0 bottom-0 w-1 bg-teal-300/30 rounded-l-md"></div>
-                                                <div className="absolute right-0 top-0 bottom-0 w-1 bg-teal-300/30 rounded-r-md"></div>
-                                            </div>
-                                        );
-                                    })}
-                                </div>
-
-                                {/* Issues/Redundancy Track */}
-                                <div className="flex-1 flex items-center px-2 gap-1 relative bg-[#1a1a1f]">
-                                    {clips.map((clip) => {
-                                        const hasRedundancy = clip.redundancies && clip.redundancies.length > 0;
-                                        const duration = clip.endTime - clip.startTime;
-                                        const clipWidth = Math.max(duration * 8, 60);
-                                        
-                                        if (!hasRedundancy) {
-                                            return <div key={clip.id} style={{ width: `${clipWidth}px` }} className="h-8 shrink-0"></div>;
-                                        }
-                                        
-                                        return (
-                                            <div 
-                                                key={clip.id}
-                                                className="h-8 rounded-md overflow-hidden flex gap-0.5"
-                                                style={{ width: `${clipWidth}px` }}
-                                            >
-                                                {clip.redundancies!.map((issue, i) => (
-                                                    <div 
-                                                        key={i} 
-                                                        className={`flex-1 rounded-md flex items-center justify-center gap-1 cursor-pointer transition-all hover:brightness-110 ${
-                                                            issue.type === 'silence' 
-                                                                ? 'bg-gradient-to-r from-amber-600/80 to-amber-700/80' 
-                                                                : 'bg-gradient-to-r from-rose-600/80 to-rose-700/80'
-                                                        }`}
-                                                        onClick={(e) => { e.stopPropagation(); fixRedundancy(clip.id, issue); }}
-                                                        title={issue.type === 'silence' ? `Remove ${issue.duration}s silence` : 'Auto-fix issue'}
-                                                    >
-                                                        {issue.type === 'silence' ? <MoonIcon /> : <WarningIcon />}
-                                                        <span className="text-[8px] text-white font-medium">
-                                                            {issue.type === 'silence' ? `${issue.duration}s` : 'Fix'}
-                                                        </span>
-                                                    </div>
-                                                ))}
-                                            </div>
-                                        );
-                                    })}
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
             )}
           </div>
 
